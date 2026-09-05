@@ -1,0 +1,29 @@
+# Секрети — реальні ключі/токени, ніколи не в git
+.env
+
+# Кешовані cookies сесії nz.ua
+*.pkl
+.nz_cookies.pkl
+
+# SQLite (OCR-кеш ГДЗ-сканів)
+*.db
+*.db-journal
+
+# Кеш завантажених PDF підручників
+.textbook_cache/
+
+# Профілі браузера (BrowserChatProvider, setup_browser_profile.py)
+.browser_profiles/
+
+# Логи
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Реальний вивантажений щоденник (nz_client.py --week) — містить справжні
+# дані дитини (розклад/теми ДЗ), не синтетика. Не в git.
+diary_sample.json

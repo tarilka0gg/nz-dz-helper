@@ -1,0 +1,9 @@
+requests
+beautifulsoup4
+python-dotenv
+pyyaml
+openai
+google-genai
+playwright
+pdfplumber
+python-telegram-bot
