@@ -537,11 +537,11 @@ class Book4Source(GdzSource):
                 logger.debug("Paragraph match found, continuing with page/exercise check")
                 print("_text_matches DEBUG: paragraph matched, continuing...")
             else:
-                # Якщо paragraph не знайдено в тексті, це НЕ означає що це не та тема
-                # Це може бути сторінка/вправа на попередній темі, де paragraph не вказаний
-                # Тому НЕ повертаємо False, а просто продовжуємо перевірку page/exercise
-                logger.debug("Paragraph not found in text, skipping to page/exercise check")
-                print("Paragraph not found in text, skipping to page/exercise check")
+                # Якщо paragraph не знайдено в тексті через _find_paragraph_match,
+                # але ми шукаємо саме цей параграф, відкидаємо такий скан
+                logger.debug("Paragraph not found in text, but paragraph=%s specified", paragraph)
+                print(f"Paragraph not found in text (expected: {paragraph}), rejecting this scan")
+                return False
         
         # СПЕРШУ перевіряємо патерн "стр.X (Y)" який означає "сторінка X, вправа Y"
         logger.debug("Trying PAGE_EXERCISE_RE on: %s", text)
