@@ -1965,11 +1965,29 @@ def _condition_from_gdz_scan(image_url: str, api_key: Optional[str] = None) -> O
         return None
 
 
+def _is_non_core_subject(subject: str) -> bool:
+    """
+    Перевіряє, чи є предмет непрофільним (не математика, фізика, хімія, біологія).
+    Для непрофільних предметів не треба робити сувений sanity-check через OCR.
+    """
+    return not any(
+        kw in subject
+        for kw in ("Математика", "Фізика", "Хімія", "Біологія")
+    )
+
+
 def _condition_matches(task_condition: str, gdz_condition: str, llm: LlmSolver, task: Task) -> bool:
     """
     Перевіряє, чи є дві умови задачею одну й ту саму задачу.
     Використовує LLM для семантичного порівняння.
+    
+    Для непрофільних предметів (українська мова, історія тощо) це занадто суворо,
+    тому повертає True без перевірки — GDZ можна використовувати.
     """
+    if _is_non_core_subject(task.subject):
+        logger.debug("Непрофільний предмет '%s' — пропускаю сувений sanity-check", task.subject)
+        return True
+    
     provider_name, model = llm._resolve_provider_and_model(task.subject)
     provider = llm._get_provider(provider_name, model)
     
