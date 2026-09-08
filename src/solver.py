@@ -2119,8 +2119,11 @@ def _solve_task_impl(
     if not found:
         return {"source": source, "answer": llm_answer, "confidence": "low"}
 
-    if found.get("source_image_url"):
-        return _compare_with_gdz_scan(task_for_llm, found["source_image_url"], llm, llm_answer, source)
+    gdz_image_url = found.get("source_image_url")
+    if gdz_image_url:
+        result = _compare_with_gdz_scan(task_for_llm, gdz_image_url, llm, llm_answer, source)
+        result["source_image_url"] = gdz_image_url
+        return result
 
     try:
         matches = _answers_match(llm, task_for_llm, llm_answer, found["raw_answer"])

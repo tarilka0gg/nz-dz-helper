@@ -15,6 +15,7 @@ import os
 import pickle
 import re
 import sys
+from datetime import date as _date, timedelta as _timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -188,7 +189,12 @@ class NzClient:
         """
         GET /schedule/diary?start_date=...&student_id=...&type=for-school
 
-        Повертає список днів: [{date, day_label, lessons: [...]}, ...].
+        Повертає список днів: [{date, day_label, lessons: [...]}, ...], у
+        порядку понеділок -> неділя (7 елементів). start_date МАЄ бути
+        понеділком того тижня (усі виклики в проєкті дотримуються цього) —
+        реальна дата кожного дня рахується як start_date + індекс у списку,
+        бо сторінка nz.ua не віддає дату окремо для кожного .diary-item
+        (лише текстову day_label на кшталт "вівторок, 1 вересня — сьогодні").
         Структура lessons — nz-api-notes.md, розділ 4.
         """
         url = self.base_url + "/schedule/diary"
@@ -218,9 +224,13 @@ class NzClient:
             )
             return []
 
-        return [self._parse_diary_item(item, start_date) for item in diary_items]
+        monday = _date.fromisoformat(start_date)
+        return [
+            self._parse_diary_item(item, (monday + _timedelta(days=idx)).isoformat())
+            for idx, item in enumerate(diary_items)
+        ]
 
-    def _parse_diary_item(self, item, fallback_date: str) -> dict:
+    def _parse_diary_item(self, item, item_date: str) -> dict:
         title_el = item.select_one(".diary-item__title")
         if title_el is None:
             logger.warning(".diary-item__title не знайдено — day_label буде None.")
@@ -228,7 +238,7 @@ class NzClient:
 
         lessons = [self._parse_diary_box(box) for box in item.select(".diary-box")]
 
-        return {"date": fallback_date, "day_label": day_label, "lessons": lessons}
+        return {"date": item_date, "day_label": day_label, "lessons": lessons}
 
     def _parse_diary_box(self, box) -> dict:
         lesson: dict = {
@@ -328,17 +338,47 @@ _PAGE_PATTERNS = [
 _EXERCISE_PATTERNS = [
     re.compile(r"\bвправ[ауи]?\.?\s*№?\s*(\d+(?:\.\d+)?[а-яіїєa-z]?)", re.IGNORECASE),
     re.compile(r"\bвпр\.?\s*(\d+(?:\.\d+)?[а-яіїєa-z]?)", re.IGNORECASE),
-    re.compile(r"№\s*(\d+(?:\.\d+)?[а-яіїєa-z]?)"),
+    re.compile(r"№\s*(\d+(?:\.\d+)?[а-яіїєa-z]?)", re.IGNORECASE),
+]
+
+# Продовження списку номерів ПІСЛЯ вже знайденого exercise (extract_all_
+# exercises нижче): "№27.10. 27.12, 27.13, 27.16" — реальний кейс з
+# щоденника (перевірено наживо 2026-09-07/08), де кожен наступний номер
+# відділений комою АБО крапкою-пробілом, і "№" повторюється не завжди
+# (лише перший номер має "№", решта — голі числа). Тому "№" тут опційний.
+# УВАГА: без "^" навмисно — .match(text, pos) вже анкерує пошук рівно на
+# pos; "^" тут би вимагав pos == 0 (початок УСЬОГО рядка, не позиції) і
+# ніколи не спрацьовував би для другого/третього номера в списку (реальний
+# баг, знайдений і виправлений тут-таки).
+_EXERCISE_LIST_TAIL_RE = re.compile(
+    r"\s*[,.]\s*№?\s*(\d+(?:\.\d+)?[а-яіїєa-z]?)", re.IGNORECASE
+)
+
+# "§ 5", "параграф 12", "пункт 27" — посилання на ЦІЛИЙ параграф/пункт
+# (типово для "Опрацювати §N"/"Прочитати параграф N", без конкретного
+# номера вправи). ВАЖЛИВО: раніше цей випадок не розпізнавався взагалі —
+# extract_book_page() повертав None, book_page був None, і LLM ніколи
+# навіть не намагався звернутись до textbooks[subject], хоча URL міг бути
+# налаштований — саме тому бот писав "не маю тексту параграфа" навіть коли
+# PDF підручника був підключений (баг знайдений і виправлений 2026-09-06).
+_PARAGRAPH_PATTERNS = [
+    re.compile(r"§\s*(\d+)"),
+    re.compile(r"\bпараграф\w*\.?\s*№?\s*(\d+)", re.IGNORECASE),
+    re.compile(r"\bпункт\w*\.?\s*№?\s*(\d+)", re.IGNORECASE),
 ]
 
 
 def extract_book_page(homework_text: str) -> Optional[dict]:
     """
-    Евristика regex для сторінки/вправи в тексті ДЗ.
+    Евristика regex для сторінки/вправи/параграфа в тексті ДЗ.
 
-    Повертає {"page", "exercise", "source_text"} або None, якщо жоден
-    патерн не спрацював — тоді викликач може впасти на LLM-фолбек, маючи
-    оригінальний homework_text (в полі source_text) незмінним.
+    Повертає {"page", "exercise", "paragraph", "source_text"} або None,
+    якщо жоден патерн не спрацював — тоді викликач може впасти на
+    LLM-фолбек, маючи оригінальний homework_text (в полі source_text)
+    незмінним. "exercise" — конкретна вправа (шукається як пункт умови в
+    PDF), "paragraph" — посилання на цілий §N без номера вправи (шукається
+    як весь текст параграфа для читання/вивчення) — це РІЗНІ типи
+    вилучення в textbook_source.py, тому лежать в окремих полях.
     """
     if not homework_text:
         return None
@@ -350,11 +390,54 @@ def extract_book_page(homework_text: str) -> Optional[dict]:
         (m.group(1) for pat in _EXERCISE_PATTERNS if (m := pat.search(homework_text))),
         None,
     )
+    paragraph = next(
+        (m.group(1) for pat in _PARAGRAPH_PATTERNS if (m := pat.search(homework_text))),
+        None,
+    )
 
-    if page is None and exercise is None:
+    if page is None and exercise is None and paragraph is None:
         return None
 
-    return {"page": page, "exercise": exercise, "source_text": homework_text}
+    return {
+        "page": page,
+        "exercise": exercise,
+        "paragraph": paragraph,
+        "source_text": homework_text,
+    }
+
+
+def extract_all_exercises(homework_text: str) -> list[str]:
+    """
+    Усі номери вправ, згадані в ДЗ через кому/крапку (напр. "розв'язати
+    №27.10. 27.12, 27.13, 27.16" -> ["27.10", "27.12", "27.13", "27.16"]),
+    на відміну від extract_book_page(), яка бере лише ПЕРШИЙ номер.
+
+    Використовується solve_task() (solver.py), щоб розв'язати й звірити
+    кожен номер ОКРЕМО замість змішування кількох різних вправ в одну
+    умову/відповідь (баг знайдений на реальному ДЗ з геометрії
+    2026-09-08). Один номер (чи жодного) -> список з 0-1 елементів, solve_task
+    тоді працює як раніше, без розбиття.
+    """
+    if not homework_text:
+        return []
+
+    first = next(
+        (m for pat in _EXERCISE_PATTERNS if (m := pat.search(homework_text))), None
+    )
+    if first is None:
+        return []
+
+    numbers = [first.group(1)]
+    pos = first.end()
+    while True:
+        m = _EXERCISE_LIST_TAIL_RE.match(homework_text, pos)
+        if not m:
+            break
+        numbers.append(m.group(1))
+        pos = m.end()
+
+    # dict.fromkeys — унікальні номери зі збереженням порядку появи.
+    return list(dict.fromkeys(numbers))
 
 
 # ---------------------------------------------------------------------- #

@@ -243,9 +243,18 @@ async def _send_html(update: Update, html_text: str) -> None:
             await update.message.reply_text(_strip_html_tags(chunk), parse_mode="HTML")
 
 
-async def _send_reports(update: Update, reports: list[str]) -> None:
-    """Кожен звіт (один предмет) — окреме повідомлення, а не один спільний текст."""
-    for report in reports:
+async def _send_reports(update: Update, reports: list[tuple[str, Optional[str]]]) -> None:
+    """
+    Кожен звіт (один предмет) — окреме повідомлення, а не один спільний текст.
+    
+    Fix #3: якщо reports містить image_url, шлемо фото ПЕРЕД текстом.
+    """
+    for report, image_url in reports:
+        if image_url:
+            try:
+                await update.message.reply_photo(photo=image_url)
+            except Exception as exc:
+                logger.warning("Не вдалось відправити фото з ГДЗ: %s", exc)
         await _send_html(update, report)
 
 
@@ -328,31 +337,39 @@ def _get_llm_solver() -> LlmSolver:
     return _llm_solver
 
 
-def _format_result(subject: str, homework_text: str, result: dict) -> str:
+def _format_result(subject: str, homework_text: str, result: dict) -> tuple[str, Optional[str]]:
     """
     LLM пише Markdown (solver.py _EXPLAIN_SYSTEM/_ANSWER_SYSTEM) — тут
     конвертуємо його в Telegram-HTML через markdown_to_telegram_html()
     (сам конвертер вже екранує "<"/">"/"&" і безпечно перетворює **/_/`
     на теги). subject/homework_text — сирий текст із щоденника, окремо
     екранується як завжди.
+    
+    Fix #3: повертає tuple (text, image_url), де image_url — URL скану ГДЗ,
+    якщо його знайдено і він пройшов sanity-check (source містить "gdz").
     """
     hw_preview = homework_text if len(homework_text) <= 200 else homework_text[:200] + "…"
     answer_html = markdown_to_telegram_html(result["answer"])
-    return (
+    text = (
         f"📘 <b>{html_lib.escape(subject)}</b>\n"
         f"ДЗ: {html_lib.escape(hw_preview)}\n\n"
         f"{answer_html}\n\n"
         f"<i>[джерело: {html_lib.escape(result['source'])}, "
         f"confidence: {html_lib.escape(result['confidence'])}]</i>"
     )
+    image_url = result.get("source_image_url") if "gdz" in result.get("source", "") else None
+    return (text, image_url)
 
 
-def _solve_tasks_blocking(tasks: list[Task]) -> list[str]:
+def _solve_tasks_blocking(tasks: list[Task]) -> list[tuple[str, Optional[str]]]:
     """
     Синхронна частина (мережеві виклики LLM/ГДЗ) — в окремому потоці.
     source="skipped" (просте "повторити" без контрольної, solver.py ->
     is_review_only) повністю ігнорується — жодної згадки в чаті, навіть
     не збирається в підсумок.
+    
+    Fix #3: повертає list[tuple[text, image_url]], де image_url — URL скану
+    ГДЗ, якщо його знайдено і він пройшов sanity-check (source містить "gdz").
 
     LlmSolverError (напр. "усі провайдери недоступні" з LlmSolver.solve()'а
     після вичерпаного fallback-ланцюжка) сюди прилітає ВЖЕ як коротке
@@ -361,7 +378,7 @@ def _solve_tasks_blocking(tasks: list[Task]) -> list[str]:
     """
     llm = _get_llm_solver()
     config = _get_config()
-    reports = []
+    reports: list[tuple[str, Optional[str]]] = []
     for task in tasks:
         try:
             result = solve_task(task, mode="explain", llm=llm, config=config)
@@ -370,9 +387,12 @@ def _solve_tasks_blocking(tasks: list[Task]) -> list[str]:
                 "Помилка розв'язку '%s' (%s)", task.subject, task.homework_text
             )
             reports.append(
-                f"📘 <b>{html_lib.escape(task.subject)}</b>\n"
-                f"ДЗ: {html_lib.escape(task.homework_text)}\n"
-                f"{html_lib.escape(str(exc))}"
+                (
+                    f"📘 <b>{html_lib.escape(task.subject)}</b>\n"
+                    f"ДЗ: {html_lib.escape(task.homework_text)}\n"
+                    f"{html_lib.escape(str(exc))}",
+                    None,
+                )
             )
             continue
         if result["source"] == "skipped":
@@ -477,7 +497,13 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reports = await asyncio.to_thread(_solve_tasks_blocking, [task])
 
     if reports:
-        await _send_html(update, reports[0])
+        report, image_url = reports[0]
+        if image_url:
+            try:
+                await update.message.reply_photo(photo=image_url)
+            except Exception as exc:
+                logger.warning("Не вдалось відправити фото з ГДЗ: %s", exc)
+        await _send_html(update, report)
 
 
 @_allowed_only
