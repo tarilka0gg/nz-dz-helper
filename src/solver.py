@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -23,8 +25,13 @@ from typing import Callable, Literal, Optional
 
 import yaml
 
-from nz_client import extract_book_page
-from textbook_source import DEFAULT_CACHE_DIR, download_textbook, extract_exercise_condition
+from nz_client import extract_all_exercises, extract_book_page
+from textbook_source import (
+    DEFAULT_CACHE_DIR,
+    download_textbook,
+    extract_exercise_condition_with_figure,
+    extract_paragraph_text,
+)
 
 try:
     from dotenv import load_dotenv
@@ -34,10 +41,95 @@ except ImportError:
     pass
 
 logger = logging.getLogger("solver")
+timing_logger = logging.getLogger("solver.timing")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # src/ -> корінь проєкту
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 DB_PATH = PROJECT_ROOT / "nz_solver.db"
+
+# Дефолтний таймаут openai-SDK — 600с (10 хв) + власні ретраї SDK поверх
+# нього. Реальний живий тест (промт 44, 2026-09-08) зловив CloudflareProvider
+# на 666с і 685с одного виклику — саме через відсутність цього timeout=,
+# а не через паралелізацію: один зависший провайдер тримав слот
+# _llm_semaphore (нижче) майже 11 хвилин, блокуючи все, що чекало за ним.
+# 45с — з запасом на реальні LLM-пояснення (кілька секунд-десяток), але
+# набагато швидший відмова->fallback, ніж дефолтні 600с. max_retries=1 —
+# власний fallback-ланцюжок solver.py вже перебирає ІНШИХ провайдерів при
+# невдачі, тож зайві внутрішні ретраї SDK на тому самому провайдері лише
+# затягують час до failover'у.
+_LLM_HTTP_TIMEOUT = 45.0
+_LLM_HTTP_MAX_RETRIES = 1
+
+
+# ---------------------------------------------------------------------- #
+# Профілювання (промт 44: "чого так довго?" — timing-лог навколо кожного
+# етапу /week, щоб мати РЕАЛЬНІ цифри замість здогадок про повільне місце).
+# Формат навмисно єдиний ("[timing] <етап> subject=... : X.XXXs ...") —
+# зручно для grep/агрегації після живого /week.
+# ---------------------------------------------------------------------- #
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _timed(stage: str, **fields):
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        extra = " ".join(f"{k}={v}" for k, v in fields.items())
+        timing_logger.info("[timing] %s %s: %.3fs", stage, extra, time.monotonic() - t0)
+
+
+# Обмежує КІЛЬКІСТЬ ОДНОЧАСНИХ мережевих LLM-викликів (не GDZ/PDF) в усьому
+# процесі — незалежно від того, скільки предметів/під-вправ розв'язується
+# паралельно вище (telegram_bot.py -> _SOLVE_CONCURRENCY, і тепер ще
+# _solve_multi_exercise нижче). Без цього сплеск паралельних Task (кожен
+# предмет + кожен номер вправи в ньому) міг би одразу вдарити по
+# rate-limit одного провайдера набагато швидше, ніж послідовна обробка —
+# семафор просто ставить зайві виклики в чергу, а не валить їх помилкою.
+# Розмір конфігурований (config.yaml -> llm.max_concurrent_calls), інакше
+# 6 — створюється ОДИН РАЗ на весь процес (глобальний ресурс, не на
+# LlmSolver-інстанс).
+_llm_semaphore_lock = threading.Lock()
+_llm_semaphore: Optional[threading.Semaphore] = None
+
+
+def _get_llm_semaphore(config: dict) -> threading.Semaphore:
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        with _llm_semaphore_lock:
+            if _llm_semaphore is None:
+                limit = int((config.get("llm") or {}).get("max_concurrent_calls", 6))
+                _llm_semaphore = threading.Semaphore(max(1, limit))
+                logger.info("Глобальний ліміт одночасних LLM-викликів: %d.", limit)
+    return _llm_semaphore
+
+
+def _call_provider(
+    provider: "LlmProvider", system: str, prompt: str, config: dict, *, subject: str, provider_name: str
+) -> str:
+    """
+    ЄДИНА точка виклику provider.complete() в усьому модулі (LlmSolver.solve()
+    і _answers_match) — тут і семафор (обмежує одночасність), і timing-лог
+    (скільки чекали семафора окремо від скільки тривав сам мережевий виклик).
+    """
+    sem = _get_llm_semaphore(config)
+    t_wait0 = time.monotonic()
+    sem.acquire()
+    wait_s = time.monotonic() - t_wait0
+    try:
+        t0 = time.monotonic()
+        try:
+            return provider.complete(system, prompt)
+        finally:
+            elapsed = time.monotonic() - t0
+            timing_logger.info(
+                "[timing] llm_call subject=%r provider=%s: %.3fs (чекав семафор %.3fs)",
+                subject, provider_name, elapsed, wait_s,
+            )
+    finally:
+        sem.release()
 
 
 class SolverError(Exception):
@@ -52,15 +144,33 @@ class BrowserSessionExpiredError(LlmSolverError):
     """Сесія браузерного профілю злетіла — бачу форму логіну замість чату."""
 
 
-class RateLimitError(LlmSolverError):
+class TransientProviderError(LlmSolverError):
     """
-    Провайдер повернув rate-limit/quota помилку (429/RESOURCE_EXHAUSTED).
-    Окремий тип від LlmSolverError навмисно — LlmSolver.solve() ловить
-    САМЕ цей тип, щоб автоматично пробувати наступного провайдера з
-    config.yaml -> llm.fallback_order. Інші помилки (авторизація, мережа,
-    невідомий провайдер) не мають такого автоматичного failover'у — вони
-    зазвичай означають проблему конфігурації, яку тихий fallback лише
-    замаскував би.
+    Провайдер тимчасово недоступний (rate-limit/quota АБО серверна
+    помилка/перевантаження на боці самого провайдера) — НЕ проблема
+    конфігурації. Спільний базовий клас для RateLimitError і
+    ServerUnavailableError навмисно — LlmSolver.solve() ловить САМЕ цей
+    тип (і обидва підкласи), щоб автоматично пробувати наступного
+    провайдера з config.yaml -> llm.fallback_order. Інші помилки
+    (авторизація, невідомий провайдер, зіпсована відповідь) не мають
+    такого автоматичного failover'у — вони зазвичай означають реальну
+    проблему конфігурації, яку тихий fallback лише замаскував би.
+    """
+
+
+class RateLimitError(TransientProviderError):
+    """Провайдер повернув rate-limit/quota помилку (429/RESOURCE_EXHAUSTED)."""
+
+
+class ServerUnavailableError(TransientProviderError):
+    """
+    Провайдер повернув серверну помилку/перевантаження (5xx, напр. Gemini
+    503 "model is currently experiencing high demand") — на відміну від
+    rate-limit це не "ти вичерпав ліміт", а "провайдеру зараз погано",
+    але наслідок для solve() той самий: варто спробувати наступного в
+    ланцюжку, а не одразу показувати помилку користувачу. Додано
+    2026-09-07 після реального 503 від Gemini на живому /week, який
+    раніше НЕ тригерив fallback (лише RateLimitError це робив).
     """
 
 
@@ -103,6 +213,39 @@ class Task:
 def _text_has_keyword(text: str, keywords: list[str]) -> bool:
     lowered = text.lower()
     return any(kw.lower() in lowered for kw in keywords)
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_subject(name: str) -> str:
+    return _WHITESPACE_RE.sub(" ", name).strip().casefold()
+
+
+def _lookup_by_subject(mapping: Optional[dict], subject: str) -> Optional[str]:
+    """
+    Пошук значення для subject у config.yaml -> textbooks/gdz_sources.
+    Спершу точний збіг ключа (швидкий шлях, як і раніше) — інакше
+    нормалізований (зайві пробіли схлопнуті в один, регістр ігнорується).
+
+    ВАЖЛИВО: назва предмета в щоденнику nz.ua й у config.yaml мають
+    збігатись буквально — навіть один зайвий пробіл (як-от навмисний
+    подвійний пробіл у "Українська  література", що відповідає реальному
+    артефакту nz.ua) робив точний dict-lookup крихким: одна кома,
+    скорочення чи інший регістр в назві предмета — і textbooks[subject]/
+    gdz_sources[subject] мовчки повертали None, хоча запис у конфізі
+    ФАКТИЧНО був (баг "немає книжки при наявному конфізі" — точна назва
+    просто не збігалась символ-в-символ). Виправлено 2026-09-08.
+    """
+    if not mapping:
+        return None
+    if subject in mapping:
+        return mapping[subject]
+    target = _normalize_subject(subject)
+    for key, value in mapping.items():
+        if _normalize_subject(key) == target:
+            return value
+    return None
 
 
 def is_review_only(homework_text: str, config: Optional[dict] = None) -> bool:
@@ -225,12 +368,12 @@ class Book4Source(GdzSource):
         return self._session
 
     def search(self, subject: str, book_page: dict) -> Optional[dict]:
-        textbooks = self.config.get("textbooks") or {}
-        book_url = textbooks.get(subject)
+        gdz_sources = self.config.get("gdz_sources") or {}
+        book_url = _lookup_by_subject(gdz_sources, subject)
         if not book_url:
-            logger.warning(
-                "Автор підручника не вказано для '%s' (config.yaml -> "
-                "textbooks) — іде напряму на LLM.",
+            logger.info(
+                "Немає gdz_sources[%r] в config.yaml — звірка з ГДЗ пропускається "
+                "для цього предмету.",
                 subject,
             )
             return None
@@ -559,7 +702,12 @@ class GroqProvider(LlmProvider):
             )
 
         self._openai = openai
-        self.client = openai.OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+        self.client = openai.OpenAI(
+            api_key=key,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=_LLM_HTTP_TIMEOUT,
+            max_retries=_LLM_HTTP_MAX_RETRIES,
+        )
         self.model = model
         self.max_tokens = max_tokens
 
@@ -580,6 +728,8 @@ class GroqProvider(LlmProvider):
             ) from exc
         except openai.AuthenticationError as exc:
             raise LlmSolverError(f"Невірний GROQ_API_KEY: {exc}") from exc
+        except openai.InternalServerError as exc:
+            raise ServerUnavailableError(f"Groq: серверна помилка/перевантаження: {exc}") from exc
         except openai.APIStatusError as exc:
             raise LlmSolverError(f"Groq API повернув помилку: {exc}") from exc
         except openai.APIConnectionError as exc:
@@ -625,7 +775,10 @@ class GeminiProvider(LlmProvider):
 
         self._genai_errors = genai_errors
         self._genai_types = genai_types
-        self.client = genai.Client(api_key=key)
+        self.client = genai.Client(
+            api_key=key,
+            http_options=genai_types.HttpOptions(timeout=int(_LLM_HTTP_TIMEOUT * 1000)),
+        )
         self.model = model
         self.max_tokens = max_tokens
 
@@ -650,7 +803,12 @@ class GeminiProvider(LlmProvider):
                 f"Gemini API: помилка клієнта (перевір GEMINI_API_KEY/квоти): {exc}"
             ) from exc
         except genai_errors.ServerError as exc:
-            raise LlmSolverError(f"Gemini API: серверна помилка: {exc}") from exc
+            # Саме цей шлях (напр. 503 "model is currently experiencing
+            # high demand") раніше НЕ тригерив fallback — тільки 429 через
+            # ClientError вище це робив. Реальний живий випадок
+            # (2026-09-07, /week, Геометрія) показав, що 503 теж має
+            # переходити на наступного провайдера, а не одразу падати.
+            raise ServerUnavailableError(f"Gemini API: серверна помилка/перевантаження: {exc}") from exc
         except genai_errors.APIError as exc:
             raise LlmSolverError(f"Gemini API повернув помилку: {exc}") from exc
 
@@ -665,6 +823,342 @@ class GeminiProvider(LlmProvider):
             text += (
                 "\n\n⚠️ Відповідь обірвана лімітом довжини — модель не встигла "
                 "закінчити думку. Онов max_tokens в config.yaml/GeminiProvider, "
+                "якщо це трапляється часто."
+            )
+        return text
+
+
+class OvhCloudProvider(LlmProvider):
+    """
+    base_url на oai.endpoints.kepler.ai.cloud.ovh.net. Модель за
+    замовчуванням — gpt-oss-120b (той самий каталог має й
+    Qwen3.5-397B-A17B — обидва перевірені реальні ID моделей на
+    endpoints.ai.cloud.ovh.net/catalog).
+
+    ВАЖЛИВО (перевірено наживо 2026-09-07, реальними HTTP-запитами, не за
+    документацією): анонімний тір потребує, щоб заголовок Authorization не
+    надсилався ВЗАГАЛІ — не порожній рядок (сервер відповідає 400 "invalid
+    HTTP header"), не плейсхолдер-токен (403 "authentication failed"; саме
+    так спершу й спрацювало, поки не перевірив без заголовка й отримав
+    очікуваний 429 "rate limit" — підтвердження, що анонімна автентифікація
+    приймається). А openai-python SDK ЗАВЖДИ додає Authorization: Bearer
+    <api_key> і не дає прибрати цей заголовок повністю — тому анонімний
+    шлях тут іде НАПРЯМУ через httpx (той самий контракт chat/completions,
+    без пакета `openai`); сам SDK використовується лише якщо реально
+    заданий OVH_AI_ENDPOINTS_ACCESS_TOKEN.
+
+    Анонімний тір — 2 запити/хв на IP+модель (перевищення -> 429). Тому
+    ТРОТТЛІНГ ОБОВ'ЯЗКОВИЙ: клас тримає час останнього виклику як
+    class-level стан (спільний для всіх інстансів — усі виклики цього
+    провайдера з одного процесу йдуть з одного IP, тож ліміт спільний), і
+    блокуюче чекає перед кожним запитом, якщо треба. complete() —
+    синхронний метод (виконується в робочому потоці через
+    asyncio.to_thread, не в event loop), тому тут це time.sleep(), а не
+    asyncio.sleep() — await поза корутиною неможливий; ефект той самий
+    (не блокує event loop, лише цей робочий потік).
+    """
+
+    _BASE_URL = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+    _MIN_INTERVAL = 31.0  # трохи більше 60/2=30с — запас від "впритул" у ліміт
+    _throttle_lock = threading.Lock()
+    _last_call_at = 0.0
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-oss-120b",
+        max_tokens: int = 4000,
+    ):
+        self.model = model
+        self.max_tokens = max_tokens
+        self._token = api_key or os.environ.get("OVH_AI_ENDPOINTS_ACCESS_TOKEN")
+
+        if self._token:
+            try:
+                import openai
+            except ImportError as exc:
+                raise LlmSolverError(
+                    "Пакет 'openai' не встановлено (pip install openai)."
+                ) from exc
+            self._openai = openai
+            self.client = openai.OpenAI(
+                api_key=self._token,
+                base_url=self._BASE_URL,
+                timeout=_LLM_HTTP_TIMEOUT,
+                max_retries=_LLM_HTTP_MAX_RETRIES,
+            )
+        else:
+            self._openai = None
+            self.client = None
+            try:
+                import httpx
+            except ImportError as exc:
+                raise LlmSolverError(
+                    "Пакет 'httpx' не встановлено (pip install httpx)."
+                ) from exc
+            self._httpx = httpx
+
+    def _throttle(self) -> None:
+        cls = type(self)
+        with cls._throttle_lock:
+            wait = cls._MIN_INTERVAL - (time.monotonic() - cls._last_call_at)
+            if wait > 0:
+                logger.info("OVHcloud: троттлінг — чекаю %.1fс (анонімний ліміт 2 запити/хв).", wait)
+                time.sleep(wait)
+            cls._last_call_at = time.monotonic()
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        self._throttle()
+        if self.client is not None:
+            return self._complete_authenticated(system_prompt, user_prompt)
+        return self._complete_anonymous(system_prompt, user_prompt)
+
+    def _complete_authenticated(self, system_prompt: str, user_prompt: str) -> str:
+        openai = self._openai
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except openai.RateLimitError as exc:
+            raise RateLimitError(
+                f"Денний ліміт/rate-limit вичерпано для 'ovh'. Деталі: {exc}"
+            ) from exc
+        except openai.AuthenticationError as exc:
+            raise LlmSolverError(f"Невірний OVH_AI_ENDPOINTS_ACCESS_TOKEN: {exc}") from exc
+        except openai.InternalServerError as exc:
+            raise ServerUnavailableError(f"OVHcloud: серверна помилка/перевантаження: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise LlmSolverError(f"OVHcloud API повернув помилку: {exc}") from exc
+        except openai.APIConnectionError as exc:
+            raise LlmSolverError(f"Не вдалось з'єднатись з OVHcloud API: {exc}") from exc
+
+        choice = response.choices[0] if response.choices else None
+        text = choice.message.content if choice and choice.message else None
+        if not text:
+            raise LlmSolverError("OVHcloud API повернув відповідь без тексту.")
+        if choice.finish_reason == "length":
+            text += self._TRUNCATED_NOTE
+        return text
+
+    _TRUNCATED_NOTE = (
+        "\n\n⚠️ Відповідь обірвана лімітом довжини — модель не встигла "
+        "закінчити думку. Онов max_tokens в config.yaml/OvhCloudProvider, "
+        "якщо це трапляється часто."
+    )
+
+    def _complete_anonymous(self, system_prompt: str, user_prompt: str) -> str:
+        httpx = self._httpx
+        try:
+            resp = httpx.post(
+                f"{self._BASE_URL}/chat/completions",
+                json={
+                    "model": self.model,
+                    "max_tokens": self.max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+                timeout=60,
+            )
+        except httpx.HTTPError as exc:
+            raise LlmSolverError(f"Не вдалось з'єднатись з OVHcloud API: {exc}") from exc
+
+        if resp.status_code == 429:
+            raise RateLimitError(
+                f"Денний ліміт/rate-limit вичерпано для 'ovh' (анонімно, 2/хв). "
+                f"Деталі: {resp.text[:300]}"
+            )
+        if resp.status_code >= 500:
+            raise ServerUnavailableError(
+                f"OVHcloud: серверна помилка/перевантаження {resp.status_code}: {resp.text[:300]}"
+            )
+        if resp.status_code >= 400:
+            raise LlmSolverError(
+                f"OVHcloud API повернув помилку {resp.status_code}: {resp.text[:300]}"
+            )
+
+        try:
+            data = resp.json()
+            choice = (data.get("choices") or [None])[0]
+            text = (choice or {}).get("message", {}).get("content")
+        except (ValueError, AttributeError, KeyError) as exc:
+            raise LlmSolverError(f"OVHcloud API повернув нерозбірливу відповідь: {exc}") from exc
+
+        if not text:
+            raise LlmSolverError("OVHcloud API повернув відповідь без тексту.")
+        if choice.get("finish_reason") == "length":
+            text += self._TRUNCATED_NOTE
+        return text
+
+
+class ZaiProvider(LlmProvider):
+    """OpenAI-сумісний SDK, base_url на api.z.ai (безкоштовна реєстрація, без картки)."""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "glm-4.7-flash",
+        max_tokens: int = 4000,
+    ):
+        try:
+            import openai
+        except ImportError as exc:
+            raise LlmSolverError(
+                "Пакет 'openai' не встановлено (pip install openai)."
+            ) from exc
+
+        key = api_key or os.environ.get("ZAI_API_KEY")
+        if not key:
+            raise LlmSolverError(
+                "Немає ZAI_API_KEY (ані в аргументі, ані в .env/оточенні)."
+            )
+
+        self._openai = openai
+        self.client = openai.OpenAI(
+            api_key=key,
+            base_url="https://api.z.ai/api/paas/v4",
+            timeout=_LLM_HTTP_TIMEOUT,
+            max_retries=_LLM_HTTP_MAX_RETRIES,
+        )
+        self.model = model
+        self.max_tokens = max_tokens
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        openai = self._openai
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except openai.RateLimitError as exc:
+            raise RateLimitError(
+                f"Денний ліміт/rate-limit вичерпано для 'zai'. Деталі: {exc}"
+            ) from exc
+        except openai.AuthenticationError as exc:
+            raise LlmSolverError(f"Невірний ZAI_API_KEY: {exc}") from exc
+        except openai.InternalServerError as exc:
+            raise ServerUnavailableError(f"Z.AI: серверна помилка/перевантаження: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise LlmSolverError(f"Z.AI API повернув помилку: {exc}") from exc
+        except openai.APIConnectionError as exc:
+            raise LlmSolverError(f"Не вдалось з'єднатись з Z.AI API: {exc}") from exc
+
+        choice = response.choices[0] if response.choices else None
+        text = choice.message.content if choice and choice.message else None
+        if not text:
+            raise LlmSolverError("Z.AI API повернув відповідь без тексту.")
+
+        if choice.finish_reason == "length":
+            logger.warning("Z.AI: відповідь обірвана лімітом max_tokens=%d.", self.max_tokens)
+            text += (
+                "\n\n⚠️ Відповідь обірвана лімітом довжини — модель не встигла "
+                "закінчити думку. Онов max_tokens в config.yaml/ZaiProvider, "
+                "якщо це трапляється часто."
+            )
+        return text
+
+
+class CloudflareProvider(LlmProvider):
+    """
+    OpenAI-сумісний ендпоінт Cloudflare Workers AI — РЕЗЕРВНИЙ провайдер
+    (задум користувача: "юзати як організатор якщо треба"). Підключається
+    лише як ОСТАННІЙ у config.yaml -> llm.fallback_order, не як основний
+    робочий вибір для жодного предмету — спрацьовує тільки коли всі інші
+    провайдери в ланцюжку вже впали з rate-limit.
+
+    base_url будується з CLOUDFLARE_ACCOUNT_ID (сам accountId не є
+    секретом, але без нього URL неповний), ключ — CLOUDFLARE_API_TOKEN.
+    Модель за замовчуванням — @cf/deepseek-ai/deepseek-r1-distill-qwen-32b
+    (перевірено на developers.cloudflare.com/workers-ai/models — точний
+    ID, з префіксом "@cf/" обов'язково).
+    """
+
+    _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+        max_tokens: int = 4000,
+    ):
+        try:
+            import openai
+        except ImportError as exc:
+            raise LlmSolverError(
+                "Пакет 'openai' не встановлено (pip install openai)."
+            ) from exc
+
+        account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        key = api_key or os.environ.get("CLOUDFLARE_API_TOKEN")
+        if not account_id or not key:
+            raise LlmSolverError(
+                "Немає CLOUDFLARE_ACCOUNT_ID і/чи CLOUDFLARE_API_TOKEN "
+                "(ані в аргументі, ані в .env/оточенні)."
+            )
+
+        self._openai = openai
+        self.client = openai.OpenAI(
+            api_key=key,
+            base_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+            timeout=_LLM_HTTP_TIMEOUT,
+            max_retries=_LLM_HTTP_MAX_RETRIES,
+        )
+        self.model = model
+        self.max_tokens = max_tokens
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        openai = self._openai
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except openai.RateLimitError as exc:
+            raise RateLimitError(
+                f"Денний ліміт/rate-limit вичерпано для 'cloudflare'. Деталі: {exc}"
+            ) from exc
+        except openai.AuthenticationError as exc:
+            raise LlmSolverError(f"Невірний CLOUDFLARE_API_TOKEN: {exc}") from exc
+        except openai.InternalServerError as exc:
+            raise ServerUnavailableError(f"Cloudflare: серверна помилка/перевантаження: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise LlmSolverError(f"Cloudflare API повернув помилку: {exc}") from exc
+        except openai.APIConnectionError as exc:
+            raise LlmSolverError(f"Не вдалось з'єднатись з Cloudflare API: {exc}") from exc
+
+        choice = response.choices[0] if response.choices else None
+        text = choice.message.content if choice and choice.message else None
+        if not text:
+            raise LlmSolverError("Cloudflare API повернув відповідь без тексту.")
+
+        # deepseek-r1-distill теж може повернути ланцюжок міркувань прямо в
+        # тілі відповіді, обгорнутий у <think>...</think> — прибираємо, той
+        # самий випадок, що й був у видаленого SiliconFlowProvider.
+        text = self._THINK_BLOCK_RE.sub("", text).strip()
+        if not text:
+            raise LlmSolverError(
+                "Cloudflare API повернув лише <think>-блок без фінальної відповіді."
+            )
+
+        if choice.finish_reason == "length":
+            logger.warning("Cloudflare: відповідь обірвана лімітом max_tokens=%d.", self.max_tokens)
+            text += (
+                "\n\n⚠️ Відповідь обірвана лімітом довжини — модель не встигла "
+                "закінчити думку. Онов max_tokens в config.yaml/CloudflareProvider, "
                 "якщо це трапляється часто."
             )
         return text
@@ -893,6 +1387,15 @@ _PROVIDER_CLASSES: dict[str, Callable[..., LlmProvider]] = {
     "gemini": lambda model=None, config=None: GeminiProvider(
         **({"model": model} if model else {})
     ),
+    "ovh": lambda model=None, config=None: OvhCloudProvider(
+        **({"model": model} if model else {})
+    ),
+    "zai": lambda model=None, config=None: ZaiProvider(
+        **({"model": model} if model else {})
+    ),
+    "cloudflare": lambda model=None, config=None: CloudflareProvider(
+        **({"model": model} if model else {})
+    ),
     "deepseek_browser": lambda model=None, config=None: BrowserChatProvider(
         service="deepseek", config=config
     ),
@@ -925,6 +1428,11 @@ class LlmSolver:
     def __init__(self, config: Optional[dict] = None):
         self.config = config if config is not None else _load_config()
         self._provider_cache: dict[tuple[str, Optional[str]], LlmProvider] = {}
+        # telegram_bot.py тепер розв'язує декілька Task паралельно (окремі
+        # робочі потоки через asyncio.to_thread) — без локу конкурентний
+        # перший виклик _get_provider() для того самого (name, model) міг би
+        # створити провайдера двічі (check-then-act без атомарності).
+        self._provider_lock = threading.Lock()
 
     def _resolve_provider_and_model(self, subject: str) -> tuple[str, Optional[str]]:
         llm_cfg = self.config.get("llm") or {}
@@ -956,14 +1464,18 @@ class LlmSolver:
     def _get_provider(self, name: str, model: Optional[str]) -> LlmProvider:
         cache_key = (name, model)
         if cache_key not in self._provider_cache:
-            factory = _PROVIDER_CLASSES.get(name)
-            if factory is None:
-                raise LlmSolverError(
-                    f"Невідомий провайдер '{name}' в config.yaml "
-                    f"(llm.default_provider/overrides) — доступні: "
-                    f"{', '.join(_PROVIDER_CLASSES)}."
-                )
-            self._provider_cache[cache_key] = factory(model=model, config=self.config)
+            with self._provider_lock:
+                # Подвійна перевірка під локом — інший потік міг встигнути
+                # створити провайдера, поки ми чекали на лок.
+                if cache_key not in self._provider_cache:
+                    factory = _PROVIDER_CLASSES.get(name)
+                    if factory is None:
+                        raise LlmSolverError(
+                            f"Невідомий провайдер '{name}' в config.yaml "
+                            f"(llm.default_provider/overrides) — доступні: "
+                            f"{', '.join(_PROVIDER_CLASSES)}."
+                        )
+                    self._provider_cache[cache_key] = factory(model=model, config=self.config)
         return self._provider_cache[cache_key]
 
     def solve(
@@ -1017,15 +1529,19 @@ class LlmSolver:
                 task.subject,
                 name,
                 model or "(дефолтна для провайдера)",
-                "" if idx == 0 else " [fallback після rate-limit]",
+                "" if idx == 0 else " [fallback]",
             )
             try:
-                return provider.complete(system, user_content)
-            except RateLimitError as exc:
+                return _call_provider(
+                    provider, system, user_content, self.config,
+                    subject=task.subject, provider_name=name,
+                )
+            except TransientProviderError as exc:
+                reason = "rate-limit/quota" if isinstance(exc, RateLimitError) else "серверна помилка"
                 logger.warning(
-                    "Провайдер '%s' впав з rate-limit/quota: %s — пробую наступного в "
-                    "ланцюжку %s.",
+                    "Провайдер '%s' впав (%s): %s — пробую наступного в ланцюжку %s.",
                     name,
+                    reason,
                     exc,
                     chain[idx + 1:] or "(більше нема)",
                 )
@@ -1134,9 +1650,13 @@ def _ocr_scan(
     на тому самому зображенні (напр. "answer" vs "condition") — інакше
     результат одного промта підмінив би результат іншого.
     """
+    t0 = time.monotonic()
     cached = _ocr_cache_get(image_url, kind=kind)
     if cached is not None:
         logger.info("OCR (%s): знайдено в кеші для %s.", kind, image_url)
+        timing_logger.info(
+            "[timing] ocr_scan_cache_hit kind=%s image=%s: %.3fs", kind, image_url, time.monotonic() - t0
+        )
         return cached
 
     try:
@@ -1164,7 +1684,10 @@ def _ocr_scan(
 
     mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
 
-    client = genai.Client(api_key=key)
+    client = genai.Client(
+        api_key=key, http_options=genai_types.HttpOptions(timeout=int(_LLM_HTTP_TIMEOUT * 1000))
+    )
+    t_vision0 = time.monotonic()
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -1179,6 +1702,11 @@ def _ocr_scan(
         raise LlmSolverError(f"OCR: Gemini Vision — серверна помилка: {exc}") from exc
     except genai_errors.APIError as exc:
         raise LlmSolverError(f"OCR: Gemini Vision повернув помилку: {exc}") from exc
+    finally:
+        timing_logger.info(
+            "[timing] ocr_scan_vision_call kind=%s image=%s: %.3fs",
+            kind, image_url, time.monotonic() - t_vision0,
+        )
 
     text = getattr(response, "text", None)
     if not text:
@@ -1203,7 +1731,10 @@ def _answers_match(llm: LlmSolver, task: Task, answer_a: str, answer_b: str) -> 
         f"Задача: {task.exercise_source_text}\n\n"
         f"Відповідь A:\n{answer_a}\n\nВідповідь B:\n{answer_b}"
     )
-    verdict = provider.complete(_COMPARE_SYSTEM, prompt)
+    verdict = _call_provider(
+        provider, _COMPARE_SYSTEM, prompt, llm.config,
+        subject=task.subject, provider_name=provider_name,
+    )
     return verdict.strip().lower().startswith("так")
 
 
@@ -1211,45 +1742,61 @@ def _answers_match(llm: LlmSolver, task: Task, answer_a: str, answer_b: str) -> 
 # solve_task
 # ---------------------------------------------------------------------- #
 
-def _resolve_scan_result(
-    task: Task,
-    found: dict,
-    mode: Literal["answer", "explain"],
-    llm: LlmSolver,
-    assessment_prep: bool = False,
-) -> dict:
-    image_url = found["source_image_url"]
-
-    # Спершу пробуємо розпізнати саму УМОВУ задачі з того ж скану, щоб LLM
-    # розв'язував реальну задачу, а не вгадував з короткого запису типу
-    # "Виконати №1.13".
-    condition_text = None
+def _condition_from_gdz_scan(image_url: str, api_key: Optional[str] = None) -> Optional[str]:
+    """
+    OCR-нути УМОВУ задачі зі скану ГДЗ (не відповідь, а саме постановка завдання).
+    Якщо умоди немає — повертає None (або NO_CONDITION_MARKER).
+    """
     try:
-        condition = _ocr_scan(
-            image_url, prompt=_OCR_CONDITION_PROMPT, kind="condition"
-        ).strip()
-        if condition and condition != _NO_CONDITION_MARKER:
-            condition_text = condition
+        condition_text = _ocr_scan(image_url, prompt=_OCR_CONDITION_PROMPT, kind="condition")
+        if condition_text == _NO_CONDITION_MARKER or not condition_text.strip():
+            return None
+        return condition_text
     except LlmSolverError as exc:
-        logger.info(
-            "OCR умови не вдався для %s: %s — LLM працюватиме з коротким "
-            "записом із щоденника.",
-            image_url,
-            exc,
+        logger.warning("OCR умови не вдався для %s: %s", image_url, exc)
+        return None
+
+
+def _condition_matches(task_condition: str, gdz_condition: str, llm: LlmSolver, task: Task) -> bool:
+    """
+    Перевіряє, чи є дві умови задачею одну й ту саму задачу.
+    Використовує LLM для семантичного порівняння.
+    """
+    provider_name, model = llm._resolve_provider_and_model(task.subject)
+    provider = llm._get_provider(provider_name, model)
+    
+    prompt = (
+        f"Чи це та сама шкільна задача?\n\n"
+        f"Варіант A (що шукали):\n{task_condition}\n\n"
+        f"Варіант B (зі скану ГДЗ):\n{gdz_condition}\n\n"
+        f"Відповідь ЛИШЕ 'так' або 'ні'."
+    )
+    
+    try:
+        verdict = _call_provider(
+            provider, _COMPARE_SYSTEM, prompt, llm.config,
+            subject=task.subject, provider_name=provider_name,
         )
+        return verdict.strip().lower().startswith("так")
+    except LlmSolverError as exc:
+        logger.warning("Порівняння умов не вдалось: %s — вважаю розбіжністю.", exc)
+        return False
 
-    task_for_llm = task
-    if condition_text:
-        task_for_llm = replace(task, exercise_source_text=condition_text)
-        logger.info("OCR розпізнав умову задачі — LLM отримає повний текст умови.")
-    else:
-        logger.info(
-            "Умова на скані не знайдена/не розпізнана — LLM працює з "
-            "коротким записом із щоденника."
-        )
 
-    llm_answer = llm.solve(task_for_llm, mode=mode, assessment_prep=assessment_prep)
-
+def _compare_with_gdz_scan(
+    task: Task, image_url: str, llm: LlmSolver, llm_answer: str, base_source: str
+) -> dict:
+    """
+    llm_answer — ВЖЕ готова LLM-відповідь (порахована ПАРАЛЕЛЬНО з пошуком
+    цього скану в solve_task, а не після нього). Тут лишається OCR-нути
+    саму відповідь зі скану й звірити з llm_answer. base_source —
+    джерело умови без звірки ("pdf+llm"/"llm"), стає "gdz+llm", якщо
+    звірка відбулась (незалежно від збігу/розбіжності — сам факт звірки
+    підвищує/знижує довіру).
+    
+    Fix #1: перед звіркою відповідей перевіряємо, чи скан насправді містить
+    ту саму умову, що й в завданні. Якщо ні — відкидаємо GDZ повністю.
+    """
     try:
         gdz_text = _ocr_scan(image_url)
     except LlmSolverError as exc:
@@ -1258,10 +1805,22 @@ def _resolve_scan_result(
             image_url,
             exc,
         )
-        return {"source": "llm", "answer": llm_answer, "confidence": "low"}
+        return {"source": base_source, "answer": llm_answer, "confidence": "low"}
+
+    gdz_condition = _condition_from_gdz_scan(image_url)
+    if gdz_condition is not None:
+        task_condition = task.exercise_source_text
+        if not _condition_matches(task_condition, gdz_condition, llm, task):
+            logger.info(
+                "OCR-умова зі скану не збігається з завданням — відкидаю GDZ. "
+                "task=%s, scan_condition=%s",
+                task_condition[:100],
+                gdz_condition[:100],
+            )
+            return {"source": base_source, "answer": llm_answer, "confidence": "low"}
 
     try:
-        matches = _answers_match(llm, task_for_llm, llm_answer, gdz_text)
+        matches = _answers_match(llm, task, llm_answer, gdz_text)
     except LlmSolverError as exc:
         logger.warning("Звірка LLM<->ГДЗ не вдалась: %s — вважаю розбіжністю.", exc)
         matches = False
@@ -1286,16 +1845,32 @@ def _resolve_scan_result(
 
 def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
     """
-    Пробує витягти реальну умову задачі з PDF підручника (config.yaml ->
-    textbooks[subject] — тепер це URL PDF, не ГДЗ-сторінки). None, якщо
-    підручник не вказано, немає номера вправи, чи текст не знайшовся —
-    ніколи не кидає виняток (мережа/PDF — best-effort primary джерело,
-    solve_task завжди має чим фолбекнутись).
+    Пробує витягти реальну умову задачі (чи текст параграфа) з PDF
+    підручника (config.yaml -> textbooks[subject]). None, якщо підручник
+    не вказано, немає ні номера вправи, ні параграфа, чи текст не
+    знайшовся — ніколи не кидає виняток (мережа/PDF — best-effort primary
+    джерело, solve_task завжди має чим фолбекнутись).
+
+    Дві гілки, за тим, що знайшлось у ДЗ (nz_client.extract_book_page):
+    - "exercise" (є конкретна вправа, напр. №27.5) -> extract_exercise_condition,
+      умова цієї вправи.
+    - "paragraph" (лише "Опрацювати §N"/"Прочитати параграф N", без номера
+      вправи) -> extract_paragraph_text, весь текст параграфа для читання.
+      ВАЖЛИВО: раніше цей випадок узагалі не оброблявся — book_page.get
+      ("exercise") був None навіть коли текст ДЗ явно посилався на §N, тому
+      PDF ніколи не підключався, хоча textbooks[subject] міг бути заданий
+      (бот тоді писав "не маю тексту параграфа", хоча джерело було під
+      рукою — баг знайдений і виправлений 2026-09-07).
     """
-    if not task.book_page or not task.book_page.get("exercise"):
+    if not task.book_page:
         return None
 
-    textbook_url = (config.get("textbooks") or {}).get(task.subject)
+    exercise = task.book_page.get("exercise")
+    paragraph = task.book_page.get("paragraph")
+    if not exercise and not paragraph:
+        return None
+
+    textbook_url = _lookup_by_subject(config.get("textbooks"), task.subject)
     if not textbook_url:
         return None
 
@@ -1306,13 +1881,90 @@ def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
         logger.info("Не вдалось завантажити підручник %s: %s", textbook_url, exc)
         return None
 
-    try:
-        return extract_exercise_condition(
-            pdf_path, task.book_page["exercise"], task.book_page.get("page")
+    if exercise:
+        try:
+            with _timed("pdf_extract_exercise", subject=task.subject, number=exercise):
+                condition = extract_exercise_condition_with_figure(
+                    pdf_path, exercise, task.book_page.get("page")
+                )
+            if condition:
+                return condition
+        except Exception as exc:
+            logger.info("Не вдалось витягти умову вправи з %s: %s", pdf_path, exc)
+
+    if paragraph:
+        try:
+            with _timed("pdf_extract_paragraph", subject=task.subject, number=paragraph):
+                return extract_paragraph_text(pdf_path, paragraph)
+        except Exception as exc:
+            logger.info("Не вдалось витягти текст параграфа з %s: %s", pdf_path, exc)
+
+    return None
+
+
+def _solve_multi_exercise(
+    task: Task,
+    numbers: list[str],
+    mode: Literal["answer", "explain"],
+    gdz: Optional[GdzSource],
+    llm: Optional[LlmSolver],
+    config: dict,
+) -> dict:
+    """
+    ДЗ згадує КІЛЬКА номерів вправ через кому/крапку (напр. "розв'язати
+    №27.10. 27.12, 27.13, 27.16") — раніше вся ця вправа йшла в LLM/ГДЗ як
+    ОДНЕ завдання: LLM бачив лише перший номер (extract_book_page бере
+    тільки його), а PDF-умова/ГДЗ-звірка для решти номерів або взагалі не
+    відбувалась, або (при пошуку в ГДЗ за діапазоном сторінки) змішувала
+    відповіді сусідніх номерів в одному сканованому зображенні. Тепер
+    кожен номер розв'язується й звіряється ОКРЕМО (рекурсивний виклик
+    solve_task з book_page, де exercise = саме цей номер) — реальний
+    кейс і баг знайдені 2026-09-08.
+
+    ВАЖЛИВО (промт 44): номери розв'язуються ПАРАЛЕЛЬНО (ThreadPoolExecutor),
+    а не один за одним у циклі — послідовний for-цикл тут множив би час
+    /week лінійно на кількість номерів (той самий баг, що вже колись
+    виправляли для предметів між собою — тут та сама проблема всередині
+    ОДНОГО предмета). Загальна кількість одночасних мережевих LLM-викликів
+    все одно обмежена _llm_semaphore (config.yaml -> llm.max_concurrent_calls),
+    тож розпаралелення тут не б'є по rate-limit сильніше, ніж уже й так
+    б'ють паралельні предмети/дні з telegram_bot.py.
+    """
+    gdz = gdz or Book4Source(config=config)
+    llm = llm or LlmSolver(config=config)
+
+    def _solve_one(number: str) -> dict:
+        sub_book_page = dict(task.book_page or {})
+        sub_book_page["exercise"] = number
+        sub_task = Task(
+            subject=task.subject,
+            homework_text=task.homework_text,
+            book_page=sub_book_page,
+            exercise_source_text=task.homework_text,
         )
-    except Exception as exc:
-        logger.info("Не вдалось витягти умову з %s: %s", pdf_path, exc)
-        return None
+        return solve_task(
+            sub_task, mode=mode, gdz=gdz, llm=llm, config=config, _skip_multi_split=True
+        )
+
+    with _timed("solve_multi_exercise", subject=task.subject, count=len(numbers)):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(numbers)) as executor:
+            # executor.map зберігає порядок РЕЗУЛЬТАТІВ = порядку numbers,
+            # незалежно від того, який номер порахувався першим.
+            results = list(executor.map(_solve_one, numbers))
+
+    parts = []
+    sources = []
+    confidences = []
+    for number, result in zip(numbers, results):
+        parts.append(f"**№{number}:**\n{result['answer']}")
+        sources.append(result["source"])
+        confidences.append(result["confidence"])
+
+    return {
+        "source": "+".join(dict.fromkeys(sources)),
+        "answer": "\n\n".join(parts),
+        "confidence": "high" if all(c == "high" for c in confidences) else "low",
+    }
 
 
 def solve_task(
@@ -1321,19 +1973,45 @@ def solve_task(
     gdz: Optional[GdzSource] = None,
     llm: Optional[LlmSolver] = None,
     config: Optional[dict] = None,
+    _skip_multi_split: bool = False,
 ) -> dict:
     """
     Повертає {"source": "pdf+llm"|"gdz"|"gdz+llm"|"llm"|"skipped", "answer": str,
-    "confidence": "high"|"low"}.
+    "confidence": "high"|"low"}. Джерело може бути й комбінацією через "+"
+    (напр. "pdf+llm+gdz+llm"), якщо ДЗ містило кілька номерів вправ і
+    _solve_multi_exercise об'єднала результати з різними джерелами.
+
+    Тонка обгортка навколо _solve_task_impl лише заради timing-логу
+    "solve_task_total" (промт 44) — для одного номера й для КОЖНОГО
+    під-номера з _solve_multi_exercise окремо (виклики рекурсивні, тож
+    вкладені timing-записи тут очікувані й корисні: видно і загальний час
+    предмета, і час кожного номера всередині нього).
     """
     config = config if config is not None else _load_config()
+    exercise_for_log = (task.book_page or {}).get("exercise")
+    with _timed("solve_task_total", subject=task.subject, exercise=exercise_for_log):
+        return _solve_task_impl(task, mode, gdz, llm, config, _skip_multi_split)
 
+
+def _solve_task_impl(
+    task: Task,
+    mode: Literal["answer", "explain"],
+    gdz: Optional[GdzSource],
+    llm: Optional[LlmSolver],
+    config: dict,
+    _skip_multi_split: bool,
+) -> dict:
     if is_review_only(task.homework_text, config=config):
         return {
             "source": "skipped",
             "answer": "Просто повторити конспект/підручник — детальний розбір не потрібен.",
             "confidence": "high",
         }
+
+    if not _skip_multi_split:
+        numbers = extract_all_exercises(task.homework_text)
+        if len(numbers) > 1:
+            return _solve_multi_exercise(task, numbers, mode, gdz, llm, config)
 
     assessment_prep = _text_has_keyword(
         task.homework_text, config.get("assessment_keywords") or []
@@ -1371,25 +2049,61 @@ def solve_task(
             task.subject,
         )
 
-    # 2. Другорядно (опційно): звірка фінальної відповіді зі сканом ГДЗ.
-    #    ПРИМІТКА: якщо textbooks[subject] тепер містить URL PDF (а не
-    #    сторінки ГДЗ), Book4Source шукатиме посилання всередині PDF-байтів
-    #    і коректно поверне None — ця гілка фактично неактивна, поки для
-    #    Book4Source не заведуть окреме джерело URL.
+    # 2. LLM-розв'язок і пошук відповіді в ГДЗ (Book4Source, config.yaml ->
+    #    gdz_sources) ЗАВЖДИ йдуть ОДНОЧАСНО (concurrent.futures), не
+    #    послідовно "спершу LLM, потім ГДЗ якщо щось не так" — саме так і
+    #    було задумано (звірка LLM<->ГДЗ), просто раніше gdz_sources не
+    #    існувало як окреме джерело (Book4Source дивився в textbooks, які
+    #    тепер вказують на PDF, а не на сторінки ГДЗ) — тому GDZ.search()
+    #    фактично завжди повертав None, і звірка ніколи не траплялась.
     gdz = gdz or Book4Source(config=config)
-    found = gdz.search(task.subject, task.book_page)
-    if found:
-        if found.get("source_image_url"):
-            llm = llm or LlmSolver(config=config)
-            return _resolve_scan_result(
-                task_for_llm, found, mode, llm, assessment_prep=assessment_prep
-            )
-        return {"source": "gdz", "answer": found["raw_answer"], "confidence": "high"}
-
     llm = llm or LlmSolver(config=config)
-    answer = llm.solve(task_for_llm, mode=mode, assessment_prep=assessment_prep)
+
+    def _timed_gdz_search():
+        with _timed(
+            "gdz_search", subject=task.subject, exercise=(task.book_page or {}).get("exercise")
+        ):
+            return gdz.search(task.subject, task.book_page)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        gdz_future = executor.submit(_timed_gdz_search)
+        llm_future = executor.submit(llm.solve, task_for_llm, mode, assessment_prep)
+        try:
+            found = gdz_future.result()
+        except Exception as exc:  # ГДЗ ніколи не має валити весь solve_task
+            logger.info("Book4Source.search() впав: %s", exc)
+            found = None
+        llm_answer = llm_future.result()  # LlmSolverError тут пролітає нагору як і раніше
+
     source = "pdf+llm" if used_pdf_condition else "llm"
-    return {"source": source, "answer": answer, "confidence": "low"}
+
+    if not found:
+        return {"source": source, "answer": llm_answer, "confidence": "low"}
+
+    if found.get("source_image_url"):
+        return _compare_with_gdz_scan(task_for_llm, found["source_image_url"], llm, llm_answer, source)
+
+    try:
+        matches = _answers_match(llm, task_for_llm, llm_answer, found["raw_answer"])
+    except LlmSolverError as exc:
+        logger.warning("Звірка LLM<->ГДЗ (текст) не вдалась: %s — вважаю розбіжністю.", exc)
+        matches = False
+
+    if matches:
+        return {
+            "source": "gdz+llm",
+            "answer": f"{llm_answer}\n\n✅ Звірено з ГДЗ — відповіді збігаються.",
+            "confidence": "high",
+        }
+    return {
+        "source": "gdz+llm",
+        "answer": (
+            "⚠️ Розбіжність між LLM і ГДЗ — потрібна перевірка людиною.\n\n"
+            f"LLM-пояснення:\n{llm_answer}\n\n"
+            f"Відповідь з ГДЗ:\n{found['raw_answer']}"
+        ),
+        "confidence": "low",
+    }
 
 
 # ---------------------------------------------------------------------- #
