@@ -361,44 +361,37 @@ def _format_result(subject: str, homework_text: str, result: dict) -> tuple[str,
     return (text, image_url)
 
 
-def _solve_tasks_blocking(tasks: list[Task]) -> list[tuple[str, Optional[str]]]:
+async def _solve_and_send_tasks(update: Update, tasks: list[Task]) -> None:
     """
-    Синхронна частина (мережеві виклики LLM/ГДЗ) — в окремому потоці.
-    source="skipped" (просте "повторити" без контрольної, solver.py ->
-    is_review_only) повністю ігнорується — жодної згадки в чаті, навіть
-    не збирається в підсумок.
+    Асинхронна версія розв'язку завдань з відправкою по мірі готовності.
+    """
+    # Acquire lock only to get shared state (LlmSolver, config)
+    async with _state_lock:
+        llm = _get_llm_solver()
+        config = _get_config()
     
-    Fix #3: повертає list[tuple[text, image_url]], де image_url — URL скану
-    ГДЗ, якщо його знайдено і він пройшов sanity-check (source містить "gdz").
-
-    LlmSolverError (напр. "усі провайдери недоступні" з LlmSolver.solve()'а
-    після вичерпаного fallback-ланцюжка) сюди прилітає ВЖЕ як коротке
-    людське повідомлення — solver.py навмисно ніколи не кладе туди
-    сирий traceback/JSON, тож str(exc) безпечно показувати як є.
-    """
-    llm = _get_llm_solver()
-    config = _get_config()
-    reports: list[tuple[str, Optional[str]]] = []
-    for task in tasks:
+    def solve_single(task: Task) -> Optional[tuple[str, Optional[str]]]:
         try:
             result = solve_task(task, mode="explain", llm=llm, config=config)
         except LlmSolverError as exc:
             logger.exception(
                 "Помилка розв'язку '%s' (%s)", task.subject, task.homework_text
             )
-            reports.append(
-                (
-                    f"📘 <b>{html_lib.escape(task.subject)}</b>\n"
-                    f"ДЗ: {html_lib.escape(task.homework_text)}\n"
-                    f"{html_lib.escape(str(exc))}",
-                    None,
-                )
+            return (
+                f"📘 <b>{html_lib.escape(task.subject)}</b>\n"
+                f"ДЗ: {html_lib.escape(task.homework_text)}\n"
+                f"{html_lib.escape(str(exc))}",
+                None,
             )
-            continue
         if result["source"] == "skipped":
-            continue
-        reports.append(_format_result(task.subject, task.homework_text, result))
-    return reports
+            return None
+        return _format_result(task.subject, task.homework_text, result)
+
+    tasks_tasks = [asyncio.create_task(asyncio.to_thread(lambda: solve_single(t))) for t in tasks]
+    for task_coro in asyncio.as_completed(tasks_tasks):
+        report = await task_coro
+        if report is not None:
+            await _send_reports(update, [report])
 
 
 def _monday_of(d: date) -> date:
@@ -433,52 +426,41 @@ def _fetch_diary_blocking(scope: str) -> list[dict]:
 @_allowed_only
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_messages = [await _status(update, "Дивлюсь щоденник на сьогодні…")]
-    async with _state_lock:
-        try:
-            days = await asyncio.to_thread(_fetch_diary_blocking, "today")
-        except (NzLoginError, NzParseError) as exc:
-            await _status(update, f"Помилка nz.ua: {exc}")
-            return
+    try:
+        days = await asyncio.to_thread(_fetch_diary_blocking, "today")
+    except (NzLoginError, NzParseError) as exc:
+        await _status(update, f"Помилка nz.ua: {exc}")
+        return
 
-        tasks = _tasks_from_diary(days)
-        if not tasks:
-            await _status(update, "На сьогодні ДЗ не знайдено (або уроків немає).")
-            return
+    tasks = _tasks_from_diary(days)
+    if not tasks:
+        await _status(update, "На сьогодні ДЗ не знайдено (або уроків немає).")
+        return
 
-        status_messages.append(await _status(update, f"Знайшов {len(tasks)} завдань, розв'язую…"))
-        # Обидва статусні повідомлення видаляються разом через 2.5с після
-        # другого з них — саме тоді розв'язування вже почалось, і вони
-        # свою роль ("я живий, працюю") виконали.
-        asyncio.create_task(_delete_all_after(status_messages, 2.5))
-        reports = await asyncio.to_thread(_solve_tasks_blocking, tasks)
-
-    await _send_reports(update, reports)
+    status_messages.append(await _status(update, f"Знайшов {len(tasks)} завдань, розв'язую…"))
+    asyncio.create_task(_delete_all_after(status_messages, 2.5))
+    await _solve_and_send_tasks(update, tasks)
 
 
 @_allowed_only
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_messages = [await _status(update, "Дивлюсь щоденник на весь тиждень…")]
-    async with _state_lock:
-        try:
-            days = await asyncio.to_thread(_fetch_diary_blocking, "week")
-        except (NzLoginError, NzParseError) as exc:
-            await _status(update, f"Помилка nz.ua: {exc}")
-            return
+    try:
+        days = await asyncio.to_thread(_fetch_diary_blocking, "week")
+    except (NzLoginError, NzParseError) as exc:
+        await _status(update, f"Помилка nz.ua: {exc}")
+        return
 
-        tasks = _tasks_from_diary(days)
-        if not tasks:
-            await _status(update, "На цьому тижні ДЗ не знайдено.")
-            return
+    tasks = _tasks_from_diary(days)
+    if not tasks:
+        await _status(update, "На цьому тижні ДЗ не знайдено.")
+        return
 
-        status_messages.append(
-            await _status(update, f"Знайшов {len(tasks)} завдань, розв'язую… (це займе трохи часу)")
-        )
-        # Обидва статусні повідомлення видаляються разом через 2.5с після
-        # другого з них — саме тоді розв'язування вже почалось.
-        asyncio.create_task(_delete_all_after(status_messages, 2.5))
-        reports = await asyncio.to_thread(_solve_tasks_blocking, tasks)
-
-    await _send_reports(update, reports)
+    status_messages.append(
+        await _status(update, f"Знайшов {len(tasks)} завдань, розв'язую…")
+    )
+    asyncio.create_task(_delete_all_after(status_messages, 2.5))
+    await _solve_and_send_tasks(update, tasks)
 
 
 @_allowed_only
@@ -493,17 +475,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task = Task(subject=subject, homework_text=f"№{number}")
 
     await _status(update, f"Розв'язую {subject} №{number}…")
-    async with _state_lock:
-        reports = await asyncio.to_thread(_solve_tasks_blocking, [task])
-
-    if reports:
-        report, image_url = reports[0]
-        if image_url:
-            try:
-                await update.message.reply_photo(photo=image_url)
-            except Exception as exc:
-                logger.warning("Не вдалось відправити фото з ГДЗ: %s", exc)
-        await _send_html(update, report)
+    await _solve_and_send_tasks(update, [task])
 
 
 @_allowed_only

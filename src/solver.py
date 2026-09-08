@@ -445,8 +445,13 @@ class Book4Source(GdzSource):
             if not href.startswith(book_url_prefix):
                 continue
             text = a.get_text(" ", strip=True)
+            logger.debug("=== _find_matching_link проверка посилання ===")
+            logger.debug("href: %s", href)
+            logger.debug("text: %s", text)
             if self._text_matches(text, book_page):
+                logger.debug("=== _find_matching_link: ЗНАЙДЕНО ВІДПОВІДНЕ ПОСИЛАННЯ ===")
                 return href
+        logger.debug("=== _find_matching_link: ЖОДНОГО ЗБІГУ НЕ ЗНАЙДЕНО ===")
         return None
 
     @staticmethod
@@ -470,6 +475,39 @@ class Book4Source(GdzSource):
             return None
 
     @staticmethod
+    def _find_paragraph_match(text: str, target_paragraph: str) -> bool:
+        """
+        Перевіряє чи текст містить номер параграфа.
+        Наприклад: "2. Типи словників" містить paragraph=2.
+        Витягує перше число з тексту і порівнює з target_paragraph.
+        """
+        # Спробуємо знайти номер параграфа на початку тексту (наприклад "2.")
+        first_num_match = re.match(r'^(\d+)\.', text.strip())
+        if first_num_match:
+            found_paragraph = first_num_match.group(1)
+            logger.debug("Found paragraph number at start: %s (target: %s)", found_paragraph, target_paragraph)
+            if found_paragraph == target_paragraph:
+                return True
+        
+        # Якщо не знайдено на початку, шукаємо в тексті патерн "N." де N - номер
+        # Але не після першого слова (це може бути номер вправи в середині)
+        # Шукаємо патерн "N." де N - число на початку або після " № " або після " - "
+        paragraph_patterns = [
+            re.compile(r'^(\d+)\.', re.IGNORECASE),
+            re.compile(r' №\s*(\d+)\.', re.IGNORECASE),
+            re.compile(r' -\s*(\d+)\.', re.IGNORECASE),
+        ]
+        for pat in paragraph_patterns:
+            m = pat.search(text)
+            if m:
+                found_paragraph = m.group(1)
+                logger.debug("Found paragraph number via pattern %s: %s (target: %s)", pat.pattern, found_paragraph, target_paragraph)
+                if found_paragraph == target_paragraph:
+                    return True
+        
+        return False
+
+    @staticmethod
     def _ordinal_key(ordinal: tuple) -> tuple:
         major, minor = ordinal
         return (major, minor if minor is not None else -1)
@@ -477,31 +515,164 @@ class Book4Source(GdzSource):
     def _text_matches(self, text: str, book_page: dict) -> bool:
         page = book_page.get("page")
         exercise = book_page.get("exercise")
-
+        paragraph = book_page.get("paragraph")
+        
+        # DEBUG: логування вхідних даних
+        logger.debug(
+            "=== _text_matches DEBUG ===\n"
+            "Текст з посилання: %s\n"
+            "Ціль page: %s, exercise: %s, paragraph: %s",
+            text, page, exercise, paragraph
+        )
+        
+        # Якщо заданий paragraph, спершу перевіряємо його (номер параграфа/теми)
+        logger.debug("_text_matches: text=%s, book_page=%s", text, book_page)
+        print(f"_text_matches DEBUG: text={text}, book_page={book_page}")
+        if paragraph:
+            paragraph_match = self._find_paragraph_match(text, str(paragraph))
+            logger.debug("Paragraph match check: %s", paragraph_match)
+            print(f"_text_matches DEBUG: paragraph_match={paragraph_match}")
+            if paragraph_match:
+                # Якщо знайдено параграф, далі перевіряємо page/exercise для цієї теми
+                logger.debug("Paragraph match found, continuing with page/exercise check")
+                print("_text_matches DEBUG: paragraph matched, continuing...")
+            else:
+                # Якщо paragraph не знайдено в тексті, це НЕ означає що це не та тема
+                # Це може бути сторінка/вправа на попередній темі, де paragraph не вказаний
+                # Тому НЕ повертаємо False, а просто продовжуємо перевірку page/exercise
+                logger.debug("Paragraph not found in text, skipping to page/exercise check")
+                print("Paragraph not found in text, skipping to page/exercise check")
+        
+        # СПЕРШУ перевіряємо патерн "стр.X (Y)" який означає "сторінка X, вправа Y"
+        logger.debug("Trying PAGE_EXERCISE_RE on: %s", text)
         m = self._PAGE_EXERCISE_RE.search(text)
-        if m and page:
-            try:
-                if int(m.group(1)) == int(page):
-                    return exercise is None or str(m.group(2)) == str(exercise).strip()
-            except ValueError:
-                pass
+        page_exercise_match = False
+        if m:
+            found_page = int(m.group(1))
+            found_exercise = m.group(2)  # номер в дужках — це НОМЕР ВПРАВИ!
+            logger.debug("PAGE_EXERCISE_RE match: page=%s (з regex), exercise=%s (з regex)", found_page, found_exercise)
+            
+            # Якщо знайдено номер сторінки в дужках, вважати його як номер вправи
+            # Наприклад "стр.7 (6)" означає "сторінка 7, вправа 6"
+            # Але якщо page=13, це означає що шукаємо сторінку 13, а не вправу 13
+            if page:
+                if found_page == int(page):
+                    # Якщо page збігається, вважати номер в дужках як номер вправи
+                    logger.debug("Page match: found_page=%s == page=%s", found_page, page)
+                    page_exercise_match = True
+                    if exercise is None:
+                        logger.debug("=== _text_matches: MATCH (стр.(N) page only) ===")
+                        return True
+                    exercise_match = str(found_exercise) == str(exercise).strip()
+                    logger.debug("Exercise match (з дужок): %s == %s = %s", found_exercise, exercise, exercise_match)
+                    if exercise_match:
+                        logger.debug("=== _text_matches: MATCH (стр.(N)) ===")
+                        return True
+                else:
+                    # Page не збігається, це НЕ match для PAGE_EXERCISE_RE
+                    logger.debug("Page mismatch: found_page=%s != page=%s", found_page, page)
+                    page_exercise_match = False
+            elif not page:
+                # Якщо page не заданий, вважати номер в дужках як номер вправи
+                logger.debug("Page not specified, using exercise from parens: %s", found_exercise)
+                if exercise is None or str(found_exercise) == str(exercise).strip():
+                    logger.debug("=== _text_matches: MATCH (стр.(N) exercise only) ===")
+                    return True
+                page_exercise_match = True
+        
+        # Якщо page заданий і PAGE_EXERCISE_RE знайшов page, але page не збіглося,
+        # то перевіряємо чи це page range. Якщо немає "Стор.", то це НЕ match.
+        if page and m and found_page != int(page):
+            page_range_re_early = re.compile(r'Стор\.?\s*(\d+(?:\.\d+)?)\s*[-–—]\s*(?:Стор\.?\s*)?(\d+(?:\.\d+)?)', re.IGNORECASE)
+            is_page_range_early = page_range_re_early.search(text) is not None
+            if not is_page_range_early:
+                logger.debug("PAGE_EXERCISE_RE page mismatch and not page range, skipping")
+                print(f"_text_matches DEBUG: early exit for page mismatch: {found_page} != {page}")
+                return False
 
+        print(f"_text_matches DEBUG: after PAGE_EXERCISE_RE, page_exercise_match={page_exercise_match if 'page_exercise_match' in locals() else 'not set'}")
+        
         if exercise:
             target = self._parse_ordinal(str(exercise))
+            logger.debug("Parsed target exercise ordinal: %s", target)
             if target is not None:
                 tk = self._ordinal_key(target)
+                logger.debug("Target key: %s", tk)
+                
+                # СПЕРШУ перевіряємо чи це діапазон сторінок (Стор.X - Стор.Y) або вправ
+                # Якщо є "Стор." або "ст.", то це сторінки, а не вправи
+                # Підтримуємо: "Стор. 10 - 17" або "Стор. 10 - Стор. 17"
+                page_range_re = re.compile(r'Стор\.?\s*(\d+(?:\.\d+)?)\s*[-–—]\s*(?:Стор\.?\s*)?(\d+(?:\.\d+)?)', re.IGNORECASE)
+                is_page_range = page_range_re.search(text) is not None
+                
+                logger.debug("Is page range (contains Стор.): %s", is_page_range)
+                
                 rm = self._RANGE_RE.search(text)
                 if rm:
-                    lo, hi = self._parse_ordinal(rm.group(1)), self._parse_ordinal(rm.group(2))
+                    logger.debug("RANGE_RE matched groups: %s-%s", rm.group(1), rm.group(2))
+                    # Якщо це page range, парсимо як plain numbers (page), інакше як exercise ordinals
+                    if is_page_range and page:
+                        lo_str, hi_str = rm.group(1), rm.group(2)
+                        try:
+                            lo, hi = int(lo_str), int(hi_str)
+                            logger.debug("Page range parsed: lo=%s, hi=%s", lo, hi)
+                            page_val = int(page)
+                            in_range = lo <= page_val <= hi
+                            logger.debug("Page range check: %s <= %s <= %s = %s", lo, page_val, hi, in_range)
+                            if in_range:
+                                logger.debug("=== _text_matches: MATCH (PAGE RANGE) ===")
+                                return True
+                            else:
+                                # Page range не збіглося, це НЕ match
+                                logger.debug("Page range mismatch")
+                        except ValueError:
+                            logger.debug("Page range parse failed, falling back to exercise range logic")
+                            lo, hi = self._parse_ordinal(rm.group(1)), self._parse_ordinal(rm.group(2))
+                            if lo is None or hi is None:
+                                lo, hi = self._parse_ordinal(rm.group(1)), self._parse_ordinal(rm.group(2))
+                    else:
+                        lo, hi = self._parse_ordinal(rm.group(1)), self._parse_ordinal(rm.group(2))
+                    
+                    # Якщо це exercise range (або page range з помилкою парсингу), продовжуємо з ordinal
+                    # Але якщо page range успішно парсився і match, ми вже повернули True
+                    # Тут лише exercise range або page range з помилкою
+                    # Якщо lo, hi це int (page range), то пропускаємо ordinal key conversion
                     if lo is not None and hi is not None:
-                        if self._ordinal_key(lo) <= tk <= self._ordinal_key(hi):
-                            return True
+                        if isinstance(lo, tuple) and isinstance(hi, tuple):
+                            lo_key = self._ordinal_key(lo)
+                            hi_key = self._ordinal_key(hi)
+                            logger.debug("lo_key=%s, hi_key=%s", lo_key, hi_key)
+                            # Якщо це діапазон вправ, порівнюємо з exercise
+                            in_range = lo_key <= tk <= hi_key
+                            logger.debug("Range check: %s <= %s <= %s = %s", lo_key, tk, hi_key, in_range)
+                            if in_range:
+                                logger.debug("=== _text_matches: MATCH (RANGE) ===")
+                                return True
+                        else:
+                            # lo, hi це int (page range), але це вже було перевірено вище
+                            # Якщо ми тут, то page range match не відбувся (інший діапазон)
+                            logger.debug("Page range values are int, but check already failed above")
                 else:
-                    sm = self._SINGLE_NUM_RE.search(text)
-                    if sm:
-                        single = self._parse_ordinal(sm.group(1))
-                        if single is not None and single == target:
+                    # ВИПРАВЛЕНИЙ КОД: для "стр.X (Y)" вважати Y як номер вправи, а не X
+                    # Перевіряємо чи є в тексті патерн "стр.X (Y)" — якщо є, використовуємо Y
+                    single = None
+                    pe_match = self._PAGE_EXERCISE_RE.search(text)
+                    if pe_match:
+                        found_exercise = pe_match.group(2)
+                        single = self._parse_ordinal(found_exercise)
+                        logger.debug("PAGE_EXERCISE_RE found exercise in parens: %s", single)
+                    else:
+                        sm = self._SINGLE_NUM_RE.search(text)
+                        if sm:
+                            single = self._parse_ordinal(sm.group(1))
+                            logger.debug("SINGLE_NUM_RE match: %s", single)
+                    if single is not None:
+                        exact_match = single == target
+                        logger.debug("Exact match: %s == %s = %s", single, target, exact_match)
+                        if exact_match:
+                            logger.debug("=== _text_matches: MATCH (SINGLE) ===")
                             return True
+        logger.debug("=== _text_matches: NO MATCH ===")
         return False
 
     def _extract_text_answer(self, html: str) -> Optional[dict]:
@@ -619,12 +790,6 @@ _EXPLAIN_SYSTEM_HUMANITIES = """\
 - **жирний текст** для ключових термінів/висновків.
 - _курсив_ для другорядного наголосу (рідко).
 - Списки — звичайним текстом: "•" або "1.", "2." на новому рядку.
-
-Відповідай українською мовою.
-"""
-
-_EXPLAIN_SYSTEM = _EXPLAIN_SYSTEM_EXACT
-  з "•" або "1.", "2." — БЕЗ Markdown-таблиць (рядків з "|") і без ### заголовків.
 
 Відповідай українською мовою.
 """
@@ -1787,9 +1952,13 @@ def _condition_from_gdz_scan(image_url: str, api_key: Optional[str] = None) -> O
     Якщо умоди немає — повертає None (або NO_CONDITION_MARKER).
     """
     try:
+        logger.info("OCR умови зі скану ГДЗ: %s", image_url)
         condition_text = _ocr_scan(image_url, prompt=_OCR_CONDITION_PROMPT, kind="condition")
+        logger.info("OCR-умова отримана: %s", condition_text[:200] if len(condition_text) > 200 else condition_text)
         if condition_text == _NO_CONDITION_MARKER or not condition_text.strip():
+            logger.info("OCR умови не знайдено (NO_CONDITION_MARKER або порожній текст)")
             return None
+        logger.info("OCR умова успішно отримана")
         return condition_text
     except LlmSolverError as exc:
         logger.warning("OCR умови не вдався для %s: %s", image_url, exc)
@@ -1804,6 +1973,15 @@ def _condition_matches(task_condition: str, gdz_condition: str, llm: LlmSolver, 
     provider_name, model = llm._resolve_provider_and_model(task.subject)
     provider = llm._get_provider(provider_name, model)
     
+    # DEBUG: логування перед порівнянням
+    logger.info(
+        "=== SANITY-CHECK DEBUG ===\n"
+        "Ціль (task.exercise_source_text):\n%s\n\n"
+        "Знайдено в ГДЗ (OCR-умова зі скану):\n%s\n\n"
+        "Порівнюю через LLM...",
+        task_condition, gdz_condition
+    )
+    
     prompt = (
         f"Чи це та сама шкільна задача?\n\n"
         f"Варіант A (що шукали):\n{task_condition}\n\n"
@@ -1811,12 +1989,23 @@ def _condition_matches(task_condition: str, gdz_condition: str, llm: LlmSolver, 
         f"Відповідь ЛИШЕ 'так' або 'ні'."
     )
     
+    # DEBUG: вивести повний промпт для аналізу
+    logger.info(
+        "=== SANITY-CHECK PROMPT ===\n"
+        "System prompt:\n%s\n\n"
+        "User prompt:\n%s",
+        _COMPARE_SYSTEM, prompt
+    )
+    
     try:
         verdict = _call_provider(
             provider, _COMPARE_SYSTEM, prompt, llm.config,
             subject=task.subject, provider_name=provider_name,
         )
-        return verdict.strip().lower().startswith("так")
+        logger.info("LLM відповів на порівняння: %s", verdict.strip())
+        result = verdict.strip().lower().startswith("так")
+        logger.info("=== SANITY-CHECK RESULT: %s ===", "MATCH" if result else "NO MATCH")
+        return result
     except LlmSolverError as exc:
         logger.warning("Порівняння умов не вдалось: %s — вважаю розбіжністю.", exc)
         return False
