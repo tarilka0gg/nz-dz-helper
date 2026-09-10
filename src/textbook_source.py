@@ -72,6 +72,25 @@ def _header_pattern_for(target: str) -> re.Pattern:
 # замість умови саме вправи 7а (баг знайдений і виправлений 2026-09-08).
 _LETTERED_SUFFIX_RE = re.compile(r"^(\d+(?:\.\d+)?)([а-яіїєА-ЯІЇЄa-zA-Z])$")
 
+# Деякі PDF (перевірено наживо: 10-klas-anglijska-mova-karpjuk-2018.pdf)
+# мають шрифт БЕЗ коректної ToUnicode-таблиці — pdfplumber тоді витягує
+# не букви, а сирі номери гліфів на кшталт "(cid:43)(cid:50)(cid:58)"
+# замість тексту. Раніше такий "текст" все одно передавався в LLM як
+# нібито реальна умова (source=pdf+llm), хоча він абсолютно нечитний —
+# LLM чесно писав "не маю тексту параграфа" на купу "(cid:N)", а
+# джерело помилково показувало pdf+llm. Реальний баг, знайдений і
+# виправлений 2026-09-09: якщо текст переважно з таких токенів —
+# вважаємо, що PDF нічого корисного не дав (None), а не підсовуємо
+# сміття.
+_CID_GLYPH_RE = re.compile(r"\(cid:\d+\)")
+
+
+def _looks_garbled(text: str, threshold: float = 0.15) -> bool:
+    if not text:
+        return False
+    glyph_chars = sum(len(m.group(0)) for m in _CID_GLYPH_RE.finditer(text))
+    return glyph_chars / len(text) > threshold
+
 # Підпункти всередині вправи позначені ВЕЛИКОЮ літерою з крапкою на
 # початку рядка ("А. Знайдіть...", "Б. створіть..."). Номер вправи в тексті
 # ДЗ зазвичай малими літерами ("7а") — порівнюємо в _extract_lettered_subpart
@@ -89,9 +108,18 @@ def _split_lettered_exercise(target: str) -> tuple[str, Optional[str]]:
 def _extract_lettered_subpart(condition: str, letter: str) -> Optional[str]:
     """
     Звужує повний текст вправи condition до підпункту letter (напр. "а" ->
-    шматок від "А. " до наступного "Б. "/кінця). None, якщо підпунктів з
-    такою літерою в тексті нема (тоді викликач має показати condition
-    цілком — краще ціла вправа, ніж нічого).
+    шматок від "А. " до наступного "Б. "/кінця) — з ОБОВ'ЯЗКОВИМ спільним
+    текстом-джерелом (уривок/речення/SMS тощо) ПЕРЕД першим підпунктом,
+    якщо він є. Без цього префікса завдання на кшталт "А. Знайдіть у
+    ТЕКСТІ слова..." лишалось би без самого тексту, на який посилається
+    — LLM тоді (правильно!) писав "не маю тексту параграфа", бо тексту
+    справді не було в тому, що ми йому передали (реальний баг, знайдений
+    і виправлений 2026-09-09: спільний уривок читання ("Українська
+    Вікіпедія...") стоїть у PDF ПЕРЕД "А."/"Б.", належить їм ОБОМ, і
+    раніше відрізався разом з рештою вправи).
+
+    None, якщо підпунктів з такою літерою в тексті нема (тоді викликач
+    має показати condition цілком — краще ціла вправа, ніж нічого).
     """
     target = letter.upper()
     headers = list(_SUBITEM_HEADER_RE.finditer(condition))
@@ -100,7 +128,10 @@ def _extract_lettered_subpart(condition: str, letter: str) -> Optional[str]:
             start = m.end()
             end = headers[i + 1].start() if i + 1 < len(headers) else len(condition)
             sub = condition[start:end].strip()
-            return sub or None
+            if not sub:
+                return None
+            preamble = condition[: headers[0].start()].strip()
+            return f"{preamble}\n\n{sub}" if preamble else sub
     return None
 
 
@@ -374,6 +405,13 @@ def extract_exercise_condition(
             "[timing] pdf_index_hit file=%s number=%s: %.3fs",
             pdf_path.name, base, time.monotonic() - t0,
         )
+        if _looks_garbled(cached):
+            logger.warning(
+                "PDF %s дає нечитний текст (шрифт без ToUnicode, суцільні "
+                "(cid:N)) для вправи %s — ігнорую, як пусту умову.",
+                pdf_path.name, base,
+            )
+            return None
         if letter:
             return _extract_lettered_subpart(cached, letter) or cached
         return cached
@@ -412,6 +450,8 @@ def extract_exercise_condition(
                     approx_index = int(page_hint) - 1
                     window = range(max(0, approx_index - 3), min(total_pages, approx_index + 4))
                     result = _scan_for_exercise(pdf, window, base, header_re)
+                    if result and _looks_garbled(result):
+                        result = None
                     if result:
                         if letter:
                             return _extract_lettered_subpart(result, letter) or result
@@ -420,6 +460,8 @@ def extract_exercise_condition(
                     pass
 
             result = _scan_for_exercise(pdf, range(total_pages), base, header_re)
+            if result and _looks_garbled(result):
+                return None
             if result and letter:
                 return _extract_lettered_subpart(result, letter) or result
             return result
@@ -434,11 +476,18 @@ def extract_exercise_condition(
 
 
 _FIGURE_DESCRIPTION_PROMPT = (
-    "На цьому зображенні — рисунок зі сторінки підручника геометрії/математики. "
-    "Опиши СХЕМАТИЧНО, що на ньому зображено: яка фігура (трикутник, площина, "
-    "многогранник тощо), які точки/відрізки/кути/довжини позначені і як вони "
-    "співвідносяться. 2-4 речення, без вступних фраз — одразу опис."
+    "На цьому зображенні — сторінка підручника геометрії/математики/фізики, "
+    "яка МОЖЕ містити рисунок (трикутник, площина, многогранник, графік "
+    "тощо), а може бути просто текстом без жодного креслення (детектор "
+    "спрацював на декоративні лінії/рамку). "
+    "Якщо реального рисунка/схеми/графіка НЕМАЄ — поверни РІВНО текст: "
+    "NO_FIGURE, нічого іншого не додавай. "
+    "Якщо рисунок Є — опиши СХЕМАТИЧНО: яка фігура, які точки/відрізки/кути/"
+    "довжини позначені і як вони співвідносяться. 2-4 речення, без вступних "
+    "фраз — одразу опис."
 )
+
+_NO_FIGURE_MARKER = "NO_FIGURE"
 
 
 def _describe_page_figure(pdf_path: Path, page_index: int) -> Optional[str]:
@@ -536,6 +585,16 @@ def _describe_page_figure(pdf_path: Path, page_index: int) -> Optional[str]:
     if not description:
         return None
 
+    # Модель сама каже "малюнка нема" (детектор нижче за порогом >5
+    # ліній/рамок спрацював хибно, напр. на декоративну рамку чи таблицю)
+    # — НЕ кешуємо і НЕ повертаємо цей текст як опис. Раніше такий "опис"
+    # (навіть коли модель писала своїми словами на кшталт "На зображенні
+    # відсутні геометричні фігури…", без явного маркера) все одно
+    # приліплювався до умови вправи й плутав LLM — реальний баг, знайдений
+    # і виправлений 2026-09-09.
+    if description.strip().upper().startswith(_NO_FIGURE_MARKER):
+        return None
+
     conn = _index_db_connect()
     try:
         conn.execute(
@@ -619,6 +678,12 @@ def extract_paragraph_text(
             "[timing] pdf_index_hit file=%s number=§%s: %.3fs",
             pdf_path.name, target, time.monotonic() - t0,
         )
+        if _looks_garbled(cached):
+            logger.warning(
+                "PDF %s дає нечитний текст (шрифт без ToUnicode) для §%s — "
+                "ігнорую, як пусту умову.", pdf_path.name, target,
+            )
+            return None
         return cached[:max_chars]
 
     # Індекс мав би вже покрити весь документ — сюди доходимо лише якщо
@@ -653,5 +718,73 @@ def extract_paragraph_text(
             start = m.end()
             end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
             content = text[start:end].strip()
+            if content and _looks_garbled(content):
+                return None
             return content[:max_chars] if content else None
     return None
+
+
+def extract_page_range_text(
+    pdf_path: Path, page_start: str, page_end: Optional[str] = None, max_chars: int = 6000
+) -> Optional[str]:
+    """
+    Витягує текст із друкованих сторінок [page_start, page_end] (обидві
+    включно; page_end=None -> лише page_start) — для ДЗ на кшталт
+    "Опрацювати матеріал на ст.3-10, скласти план", де НЕМАЄ ні номера
+    вправи, ні §N, лише діапазон сторінок (типово для читання суцільного
+    тексту художнього твору чи розділу). Раніше такий випадок взагалі не
+    мав шляху вилучення умови — extract_book_page знаходив лише "page",
+    а _condition_from_textbook_pdf вимагав exercise/paragraph і одразу
+    здавався — LLM завжди йшов без реального тексту (баг знайдений і
+    виправлений 2026-09-09).
+
+    Друкована сторінка -> pdfplumber-індекс: та сама евристика
+    "printed - 1" (перевірено наживо, як і для page_hint в
+    extract_exercise_condition), з тим самим застереженням — не гарантія
+    для будь-якого PDF, але наявних підручників це стабільно тримається.
+    Обрізає до max_chars (кілька сторінок разом можуть бути довгими).
+    None, якщо сторінки поза межами документа чи PDF не читається —
+    ніколи не кидає виняток.
+    """
+    try:
+        start = int(page_start)
+    except (TypeError, ValueError):
+        return None
+    try:
+        end = int(page_end) if page_end else start
+    except (TypeError, ValueError):
+        end = start
+    if end < start:
+        start, end = end, start
+
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("Пакет 'pdfplumber' не встановлено (pip install pdfplumber).")
+        return None
+
+    t0 = time.monotonic()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            lo = max(0, start - 1)
+            hi = min(total_pages, end)
+            if lo >= hi:
+                return None
+            text = "\n".join((pdf.pages[i].extract_text() or "") for i in range(lo, hi)).strip()
+    except Exception as exc:
+        logger.info("Не вдалось прочитати %s: %s", pdf_path, exc)
+        return None
+    finally:
+        timing_logger.info(
+            "[timing] pdf_page_range file=%s pages=%s-%s: %.3fs",
+            pdf_path.name, start, end, time.monotonic() - t0,
+        )
+
+    if text and _looks_garbled(text):
+        logger.warning(
+            "PDF %s дає нечитний текст (шрифт без ToUnicode) для сторінок "
+            "%s-%s — ігнорую, як пусту умову.", pdf_path.name, start, end,
+        )
+        return None
+    return text[:max_chars] if text else None

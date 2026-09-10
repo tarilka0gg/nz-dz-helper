@@ -329,10 +329,16 @@ class NzClient:
 # Евристика "підручник / сторінка / вправа" з тексту ДЗ
 # ---------------------------------------------------------------------- #
 
+# Друга група — опційний кінець діапазону ("ст.3-10" -> сторінки 3, кінець
+# 10). Реальний кейс ДЗ без жодного §N/номера вправи ("Опрацювати
+# матеріал на ст.3-10, напис. план") — extract_book_page() раніше віддавав
+# лише "3", solve_task взагалі не мав шляху витягти текст (тільки
+# exercise/paragraph гілки) і завжди йшов на LLM без умови — баг
+# знайдений і виправлений 2026-09-09 (extract_page_range_text нижче).
 _PAGE_PATTERNS = [
-    re.compile(r"\bстор(?:інка|\.)?\s*(\d+)", re.IGNORECASE),
-    re.compile(r"\bст\.?\s*(\d+)", re.IGNORECASE),
-    re.compile(r"\bс\.\s*(\d+)", re.IGNORECASE),
+    re.compile(r"\bстор(?:інка|\.)?\s*(\d+)(?:\s*[-–—]\s*(\d+))?", re.IGNORECASE),
+    re.compile(r"\bст\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?", re.IGNORECASE),
+    re.compile(r"\bс\.\s*(\d+)(?:\s*[-–—]\s*(\d+))?", re.IGNORECASE),
 ]
 
 _EXERCISE_PATTERNS = [
@@ -383,9 +389,11 @@ def extract_book_page(homework_text: str) -> Optional[dict]:
     if not homework_text:
         return None
 
-    page = next(
-        (m.group(1) for pat in _PAGE_PATTERNS if (m := pat.search(homework_text))), None
+    page_match = next(
+        (m for pat in _PAGE_PATTERNS if (m := pat.search(homework_text))), None
     )
+    page = page_match.group(1) if page_match else None
+    page_end = page_match.group(2) if page_match else None
     exercise = next(
         (m.group(1) for pat in _EXERCISE_PATTERNS if (m := pat.search(homework_text))),
         None,
@@ -400,6 +408,7 @@ def extract_book_page(homework_text: str) -> Optional[dict]:
 
     return {
         "page": page,
+        "page_end": page_end,
         "exercise": exercise,
         "paragraph": paragraph,
         "source_text": homework_text,

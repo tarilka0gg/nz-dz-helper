@@ -371,8 +371,10 @@ async def _solve_and_send_tasks(update: Update, tasks: list[Task]) -> None:
         config = _get_config()
     
     def solve_single(task: Task) -> Optional[tuple[str, Optional[str]]]:
+        logger.info("=== solve_single: subject=%s, homework=%s ===", task.subject, task.homework_text)
         try:
             result = solve_task(task, mode="explain", llm=llm, config=config)
+            logger.info("=== solve_single: subject=%s, result source=%s ===", task.subject, result.get("source"))
         except LlmSolverError as exc:
             logger.exception(
                 "Помилка розв'язку '%s' (%s)", task.subject, task.homework_text
@@ -384,10 +386,21 @@ async def _solve_and_send_tasks(update: Update, tasks: list[Task]) -> None:
                 None,
             )
         if result["source"] == "skipped":
+            logger.debug("=== solve_single: skipped ===")
             return None
         return _format_result(task.subject, task.homework_text, result)
 
-    tasks_tasks = [asyncio.create_task(asyncio.to_thread(lambda: solve_single(t))) for t in tasks]
+    # УВАГА: НЕ "lambda: solve_single(t)" — таке замикання захоплює змінну
+    # циклу t ЗА ПОСИЛАННЯМ, а сам виклик лямбди (в робочому потоці)
+    # відбувається вже ПІСЛЯ того, як список-генератор повністю
+    # відпрацював і t вказує на ОСТАННІЙ елемент tasks. Через це всі
+    # паралельні "завдання" розв'язували те саме останнє ДЗ зі списку —
+    # звідси дублювання відповідей і підміна всіх предметів на останній
+    # (типово Укр. мова/література, залежно що останнє в щоденнику) —
+    # реальний баг, знайдений і виправлений 2026-09-09. asyncio.to_thread
+    # приймає аргументи функції напряму і зв'язує їх ОДРАЗУ, на цій
+    # ітерації — саме це й потрібно.
+    tasks_tasks = [asyncio.create_task(asyncio.to_thread(solve_single, t)) for t in tasks]
     for task_coro in asyncio.as_completed(tasks_tasks):
         report = await task_coro
         if report is not None:

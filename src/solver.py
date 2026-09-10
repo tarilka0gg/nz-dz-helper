@@ -29,7 +29,9 @@ from nz_client import extract_all_exercises, extract_book_page
 from textbook_source import (
     DEFAULT_CACHE_DIR,
     download_textbook,
+    extract_exercise_condition,
     extract_exercise_condition_with_figure,
+    extract_page_range_text,
     extract_paragraph_text,
 )
 
@@ -248,6 +250,21 @@ def _lookup_by_subject(mapping: Optional[dict], subject: str) -> Optional[str]:
     return None
 
 
+# Предмети, де умова реально посилається на рисунок/схему в підручнику —
+# лише для них варто платити Vision-викликом на кожну вправу
+# (extract_exercise_condition_with_figure нижче). Для решти предметів
+# (мови, історія, суспільствознавство тощо) підручник текстовий, і
+# Vision-виклик там лише витрачав квоту та повертав шумний опис на
+# кшталт "На зображенні відсутні геометричні фігури…", який приліплювався
+# до умови й плутав LLM — реальний баг, знайдений і виправлений 2026-09-09.
+_FIGURE_RELEVANT_KEYWORDS = ("геометрі", "математик", "фізик")
+
+
+def _subject_may_have_figures(subject: str) -> bool:
+    lowered = subject.lower()
+    return any(kw in lowered for kw in _FIGURE_RELEVANT_KEYWORDS)
+
+
 def is_review_only(homework_text: str, config: Optional[dict] = None) -> bool:
     """
     True, якщо ДЗ — це просто "повторити конспект/матеріал" (config.yaml ->
@@ -445,6 +462,14 @@ class Book4Source(GdzSource):
             if not href.startswith(book_url_prefix):
                 continue
             text = a.get_text(" ", strip=True)
+            
+            # Skip "garbage" links that lead to main pages or subject lists
+            # These don't contain specific exercise/page info and will match incorrectly
+            if self._is_garbage_link(text, href):
+                logger.debug("=== _find_matching_link: SKIP GARBAGE LINK ===")
+                logger.debug("text: %s, href: %s", text, href)
+                continue
+            
             logger.debug("=== _find_matching_link проверка посилання ===")
             logger.debug("href: %s", href)
             logger.debug("text: %s", text)
@@ -453,6 +478,43 @@ class Book4Source(GdzSource):
                 return href
         logger.debug("=== _find_matching_link: ЖОДНОГО ЗБІГУ НЕ ЗНАЙДЕНО ===")
         return None
+
+    @staticmethod
+    def _is_garbage_link(text: str, href: str) -> bool:
+        """
+        Перевіряє, чи посилання є "мусорним" (веде на головну сторінку, список підручників тощо).
+        Такі посилання не містять конкретної інформації про вправу/сторінку і можуть неправильно збігтися.
+        """
+        # Check if href is a main page or navigation
+        if href.endswith(("/", "/index.html", "/main.html")):
+            return True
+        
+        # Check if text looks like navigation/menu
+        garbage_patterns = [
+            r"^Підручники\s*\d+\s*клас.*$",
+            r"^ГДЗ\s*\d+\s*клас.*$",
+            r"^[Пп]ро\s*[Пп]роект$",
+            r"^[Яя]\s*[Уу]\s*[Ссвіті]$",
+            r"^[Аа]нглійська\s*[Мм]ова.*$",
+            r"^[Бб]іологія$",
+            r"^[Зз]арубіжна\s*[Лл]ітература$",
+            r"^[Уу]країнська\s*[Лл]ітература$",
+            r"^[Уу]країнська\s*[Мм]ова$",
+            r"^[Фф]ранцузька\s*[Мм]ова$",
+            r"^[Яя]\s*[Уу]\s*[Ссвіті]$",
+            r"^[ДдППАА].*$",
+            r"^[ЗзНнОо]$",
+            r"^[Рр]еферати$",
+            r"^[Аа]втори$",
+            r"^[Кк]онтакти$",
+            r"^[Пп]олітика\s*[Кк]онфідентності$",
+        ]
+        import re
+        for pat in garbage_patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                return True
+        
+        return False
 
     @staticmethod
     def _parse_ordinal(text: str) -> Optional[tuple]:
@@ -533,20 +595,21 @@ class Book4Source(GdzSource):
             logger.debug("Paragraph match check: %s", paragraph_match)
             print(f"_text_matches DEBUG: paragraph_match={paragraph_match}")
             if paragraph_match:
-                # Якщо знайдено параграф, далі перевіряємо page/exercise для цієї теми
-                logger.debug("Paragraph match found, continuing with page/exercise check")
-                print("_text_matches DEBUG: paragraph matched, continuing...")
-            else:
-                # Якщо paragraph не знайдено в тексті через _find_paragraph_match,
-                # але ми шукаємо саме цей параграф, відкидаємо такий скан
-                logger.debug("Paragraph not found in text, but paragraph=%s specified", paragraph)
-                print(f"Paragraph not found in text (expected: {paragraph}), rejecting this scan")
-                return False
+                # Якщо знайдено параграф, це добре, але не обов'язково.
+                # Наприклад, ДЗ може бути "Опрацювати §2, вик. впр.7(ст.13)",
+                # але вправа 7 може бути в іншому параграфі на тій самій сторінці.
+                logger.debug("Paragraph match found, but this is not mandatory")
+                print("_text_matches DEBUG: paragraph matched (optional)")
+            # Якщо paragraph не знайдено, не відкидаємо скан — просто продовжуємо перевірку page/exercise
+            logger.debug("Paragraph not found, continuing with page/exercise check")
+            print("_text_matches DEBUG: paragraph not found, continuing...")
         
         # СПЕРШУ перевіряємо патерн "стр.X (Y)" який означає "сторінка X, вправа Y"
         logger.debug("Trying PAGE_EXERCISE_RE on: %s", text)
         m = self._PAGE_EXERCISE_RE.search(text)
         page_exercise_match = False
+        found_page = None
+        found_exercise = None
         if m:
             found_page = int(m.group(1))
             found_exercise = m.group(2)  # номер в дужках — це НОМЕР ВПРАВИ!
@@ -560,18 +623,22 @@ class Book4Source(GdzSource):
                     # Якщо page збігається, вважати номер в дужках як номер вправи
                     logger.debug("Page match: found_page=%s == page=%s", found_page, page)
                     page_exercise_match = True
+                    print(f"_text_matches DEBUG: found_page={found_page} == page={page}, exercise={exercise}, found_exercise={found_exercise}")
                     if exercise is None:
                         logger.debug("=== _text_matches: MATCH (стр.(N) page only) ===")
                         return True
                     exercise_match = str(found_exercise) == str(exercise).strip()
                     logger.debug("Exercise match (з дужок): %s == %s = %s", found_exercise, exercise, exercise_match)
+                    print(f"_text_matches DEBUG: EXERCISE CHECK: found_exercise={found_exercise} (type={type(found_exercise)}), exercise={exercise} (type={type(exercise)}), match={exercise_match}")
                     if exercise_match:
                         logger.debug("=== _text_matches: MATCH (стр.(N)) ===")
                         return True
+                    print(f"_text_matches DEBUG: EXERCISE MATCH FAILED, continuing...")
                 else:
                     # Page не збігається, це НЕ match для PAGE_EXERCISE_RE
                     logger.debug("Page mismatch: found_page=%s != page=%s", found_page, page)
                     page_exercise_match = False
+                    print(f"_text_matches DEBUG: found_page={found_page} != page={page}, SKIP")
             elif not page:
                 # Якщо page не заданий, вважати номер в дужках як номер вправи
                 logger.debug("Page not specified, using exercise from parens: %s", found_exercise)
@@ -579,6 +646,14 @@ class Book4Source(GdzSource):
                     logger.debug("=== _text_matches: MATCH (стр.(N) exercise only) ===")
                     return True
                 page_exercise_match = True
+        
+        # DEBUG: логування стану після перевірки PAGE_EXERCISE_RE
+        logger.debug(
+            "=== _text_matches PAGE_EXERCISE_RE RESULT ===\n"
+            "m=%s, found_page=%s, found_exercise=%s, page=%s, exercise=%s\n"
+            "page_exercise_match=%s",
+            m, found_page, found_exercise, page, exercise, page_exercise_match
+        )
         
         # Якщо page заданий і PAGE_EXERCISE_RE знайшов page, але page не збіглося,
         # то перевіряємо чи це page range. Якщо немає "Стор.", то це НЕ match.
@@ -591,6 +666,14 @@ class Book4Source(GdzSource):
                 return False
 
         print(f"_text_matches DEBUG: after PAGE_EXERCISE_RE, page_exercise_match={page_exercise_match if 'page_exercise_match' in locals() else 'not set'}")
+        
+        # DEBUG: логування стану після перевірки PAGE_EXERCISE_RE
+        logger.debug(
+            "=== _text_matches PAGE_EXERCISE_RE RESULT ===\n"
+            "m=%s, found_page=%s, found_exercise=%s, page=%s, exercise=%s\n"
+            "page_exercise_match=%s",
+            m, found_page if m else None, found_exercise if m else None, page, exercise, page_exercise_match
+        )
         
         if exercise:
             target = self._parse_ordinal(str(exercise))
@@ -772,12 +855,22 @@ _EXPLAIN_SYSTEM_EXACT = """\
 _EXPLAIN_SYSTEM_HUMANITIES = """\
 Ти — репетитор, який допомагає учню 10 класу з домашнім завданням через Telegram.
 
+ВАЖЛИВО про поле "Завдання:" нижче в повідомленні користувача: якщо там
+є розгорнутий текст (умова вправи, речення для аналізу, уривок,
+питання тощо) — це РЕАЛЬНИЙ текст з підручника, і ти МАЄШ використати
+САМЕ його для відповіді (перекажи суть, виконай завдання на основі
+цього тексту). НІКОЛИ не пиши "не маю тексту параграфа", якщо в
+"Завдання:" фактично є такий текст — навіть коли сама фраза ДЗ у
+щоденнику звучить організаційно ("опрацювати §N", "вивчити" тощо):
+дивись на вміст поля "Завдання:", а не на формулювання зі щоденника.
+
 Обсяг відповіді:
 - Коротко: 3–5 речень без вступів, висновків, пафосу.
-- Для організаційних завдань ("повторити", "прочитати", "вивчити терміни",
-  "опрацювати параграф") — якщо немає конкретного тексту, скажи: "Не маю
-  тексту параграфа" і дай загальний метод роботи (2–3 речення). НІКОЛИ не
-  вигадуй конкретні терміни/факти.
+- Лише якщо "Завдання:" містить ЛИШЕ короткий організаційний запис БЕЗ
+  жодного розгорнутого тексту (напр. рівно "Повторити конспект" і
+  більше нічого) — тоді скажи: "Не маю тексту параграфа" і дай
+  загальний метод роботи (2–3 речення). НІКОЛИ не вигадуй конкретні
+  терміни/факти, яких немає в наданому тексті.
 
 Стиль:
 - НІКОЛИ не розігруй діалог "Я (репетитор):" / "Учень:" — звертайся до
@@ -2029,6 +2122,47 @@ def _condition_matches(task_condition: str, gdz_condition: str, llm: LlmSolver, 
         return False
 
 
+def _is_garbage_gdz_text(text: str) -> bool:
+    """
+    Перевіряє, чи GDZ-текст є "мусором" (головна сторінка, список підручників тощо).
+    Такі скани не містять конкретної відповіді на вправу.
+    """
+    garbage_patterns = [
+        r"^[Пп]ідручники\s*\d+\s*клас.*$",
+        r"^[Гг]ДЗ\s*\d+\s*клас.*$",
+        r"[Пп]ідручники.*\d+\s*клас.*[Гг]ДЗ",
+        r"[Дд][Пп][Аа]\s*\d+\s*клас.*$",
+        r"^[Зз][Нн][Оо]$",
+        r"^[Рр]еферати$",
+        r"^[Аа]втори$",
+        r"^[Кк]онтакти$",
+        r"^[Пп]олітика\s*[Кк]онфідентності$",
+        r"^[Мм]атеріали\s*[Сс]айту.*мають\s*[Аа]вторське\s*[Пп]раво.*$",
+        r"^[Рр]озміщення\s*[Бб]удь-якої\s*[Іі]нформації.*порушує\s*[Аа]вторське\s*[Пп]раво.*$",
+    ]
+    import re
+    text_lower = text.lower()
+    for pat in garbage_patterns:
+        if re.search(pat, text_lower, re.IGNORECASE):
+            return True
+    
+    # Якщо текст занадто довгий (більше 5000 символів), це може бути головна сторінка з меню
+    if len(text) > 5000:
+        return True
+    
+    # Якщо текст занадто короткий (менше 20 символів), це може бути помилка OCR
+    if len(text) < 20:
+        return True
+    
+    # Якщо текст містить багато "менюшних" слів, це може бути головна сторінка
+    menu_words = ["підручники", "гдз", "дпа", "зно", "реферати", "автори", "контакти", "політика", "конфідентності"]
+    menu_word_count = sum(1 for word in menu_words if word in text_lower)
+    if menu_word_count >= 3:
+        return True
+    
+    return False
+
+
 def _compare_with_gdz_scan(
     task: Task, image_url: str, llm: LlmSolver, llm_answer: str, base_source: str
 ) -> dict:
@@ -2052,6 +2186,14 @@ def _compare_with_gdz_scan(
             exc,
         )
         return {"source": base_source, "answer": llm_answer, "confidence": "low"}
+    
+    # Перевірка на "мусорні" скани (головна сторінка ГДЗ, список підручників тощо)
+    if _is_garbage_gdz_text(gdz_text):
+        logger.warning(
+            "GDZ-текст є мусором (головна сторінка/список підручників): %s... — відкидаю GDZ.",
+            gdz_text[:100] if len(gdz_text) > 100 else gdz_text
+        )
+        return {"source": base_source, "answer": llm_answer, "confidence": "low"}
 
     gdz_condition = _condition_from_gdz_scan(image_url)
     if gdz_condition is not None:
@@ -2064,6 +2206,17 @@ def _compare_with_gdz_scan(
                 gdz_condition[:100],
             )
             return {"source": base_source, "answer": llm_answer, "confidence": "low"}
+
+    # Для нетематичних предметів (українська, історія тощо) не треба викликати _answers_match(),
+    # бо OCR+LLM порівняння завжди буде помилковим (OCR читає форматування неправильно).
+    # Якщо умова співпала (вище), то вважаємо відповідь правильною.
+    if _is_non_core_subject(task.subject):
+        logger.debug("Непрофільний предмет '%s' — пропускаю звірку відповідей LLM<->ГДЗ", task.subject)
+        return {
+            "source": "gdz+llm",
+            "answer": f"{llm_answer}\n\n✅ Звірено з ГДЗ (непрофільний предмет — звірка відповідей пропущена).",
+            "confidence": "high",
+        }
 
     try:
         matches = _answers_match(llm, task, llm_answer, gdz_text)
@@ -2097,7 +2250,8 @@ def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
     знайшовся — ніколи не кидає виняток (мережа/PDF — best-effort primary
     джерело, solve_task завжди має чим фолбекнутись).
 
-    Дві гілки, за тим, що знайшлось у ДЗ (nz_client.extract_book_page):
+    Три гілки, за тим, що знайшлось у ДЗ (nz_client.extract_book_page),
+    перевіряються в цьому порядку (перший знайдений текст — переможець):
     - "exercise" (є конкретна вправа, напр. №27.5) -> extract_exercise_condition,
       умова цієї вправи.
     - "paragraph" (лише "Опрацювати §N"/"Прочитати параграф N", без номера
@@ -2107,13 +2261,19 @@ def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
       PDF ніколи не підключався, хоча textbooks[subject] міг бути заданий
       (бот тоді писав "не маю тексту параграфа", хоча джерело було під
       рукою — баг знайдений і виправлений 2026-09-07).
+    - лише "page" (жодного §N/номера вправи, напр. "Опрацювати матеріал на
+      ст.3-10, скласти план") -> extract_page_range_text, текст указаних
+      сторінок. Той самий клас бага, що й попередній — не оброблялось
+      узагалі, LLM завжди йшов без реального тексту твору/розділу (баг
+      знайдений і виправлений 2026-09-09).
     """
     if not task.book_page:
         return None
 
     exercise = task.book_page.get("exercise")
     paragraph = task.book_page.get("paragraph")
-    if not exercise and not paragraph:
+    page_only = task.book_page.get("page")
+    if not exercise and not paragraph and not page_only:
         return None
 
     textbook_url = _lookup_by_subject(config.get("textbooks"), task.subject)
@@ -2130,9 +2290,22 @@ def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
     if exercise:
         try:
             with _timed("pdf_extract_exercise", subject=task.subject, number=exercise):
-                condition = extract_exercise_condition_with_figure(
-                    pdf_path, exercise, task.book_page.get("page")
-                )
+                if _subject_may_have_figures(task.subject):
+                    condition = extract_exercise_condition_with_figure(
+                        pdf_path, exercise, task.book_page.get("page")
+                    )
+                else:
+                    # Vision-опис малюнка — лише для предметів, де рисунки
+                    # взагалі бувають (геометрія/математика/фізика). Для
+                    # решти (укр. мова, історія тощо) виклик Vision на
+                    # кожну вправу був чистими витратами: реального
+                    # малюнка нема, а модель однаково повертала опис на
+                    # кшталт "На зображенні відсутні геометричні фігури…",
+                    # який потім приліплювався до умови й плутав LLM —
+                    # реальний баг, знайдений і виправлений 2026-09-09.
+                    condition = extract_exercise_condition(
+                        pdf_path, exercise, task.book_page.get("page")
+                    )
             if condition:
                 return condition
         except Exception as exc:
@@ -2141,9 +2314,24 @@ def _condition_from_textbook_pdf(task: Task, config: dict) -> Optional[str]:
     if paragraph:
         try:
             with _timed("pdf_extract_paragraph", subject=task.subject, number=paragraph):
-                return extract_paragraph_text(pdf_path, paragraph)
+                condition = extract_paragraph_text(pdf_path, paragraph)
+            if condition:
+                return condition
         except Exception as exc:
             logger.info("Не вдалось витягти текст параграфа з %s: %s", pdf_path, exc)
+
+    page = task.book_page.get("page")
+    if page and not exercise and not paragraph:
+        # Лише діапазон сторінок, без §N/номера вправи — типово для ДЗ на
+        # кшталт "Опрацювати матеріал на ст.3-10, скласти план" (читання
+        # суцільного тексту твору/розділу). Раніше цей випадок взагалі не
+        # мав шляху вилучення умови — реальний баг, знайдений і виправлений
+        # 2026-09-09.
+        try:
+            with _timed("pdf_extract_page_range", subject=task.subject, number=page):
+                return extract_page_range_text(pdf_path, page, task.book_page.get("page_end"))
+        except Exception as exc:
+            logger.info("Не вдалось витягти текст сторінок з %s: %s", pdf_path, exc)
 
     return None
 
