@@ -240,7 +240,7 @@ async def _send_html(update: Update, html_text: str) -> None:
             await update.message.reply_text(chunk, parse_mode="HTML")
         except BadRequest as exc:
             logger.warning("HTML parse_mode не спрацював (%s) — шлю без тегів.", exc)
-            await update.message.reply_text(_strip_html_tags(chunk), parse_mode="HTML")
+            await update.message.reply_text(_strip_html_tags(chunk))
 
 
 async def _send_reports(update: Update, reports: list[tuple[str, Optional[str]]]) -> None:
@@ -314,7 +314,14 @@ def _get_config() -> dict:
 
 
 def _ensure_nz_client() -> NzClient:
-    """Синхронна частина — виконується в окремому потоці через to_thread."""
+    """
+    Синхронна частина — виконується в окремому потоці через to_thread.
+    ВИКЛИКАТИ лише під `_state_lock` (див. cmd_today/cmd_week): без нього
+    /today і /week, запущені майже одночасно, могли б обидва побачити
+    _nz_client is None і паралельно залогінитись/переписати той самий
+    файл cookies — реальний race, виправлений тут через той самий лок, що
+    вже беруть _get_llm_solver()/_get_config().
+    """
     global _nz_client
     if _nz_client is not None and _nz_client.is_logged_in():
         return _nz_client
@@ -440,7 +447,8 @@ def _fetch_diary_blocking(scope: str) -> list[dict]:
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_messages = [await _status(update, "Дивлюсь щоденник на сьогодні…")]
     try:
-        days = await asyncio.to_thread(_fetch_diary_blocking, "today")
+        async with _state_lock:
+            days = await asyncio.to_thread(_fetch_diary_blocking, "today")
     except (NzLoginError, NzParseError) as exc:
         await _status(update, f"Помилка nz.ua: {exc}")
         return
@@ -459,7 +467,8 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_messages = [await _status(update, "Дивлюсь щоденник на весь тиждень…")]
     try:
-        days = await asyncio.to_thread(_fetch_diary_blocking, "week")
+        async with _state_lock:
+            days = await asyncio.to_thread(_fetch_diary_blocking, "week")
     except (NzLoginError, NzParseError) as exc:
         await _status(update, f"Помилка nz.ua: {exc}")
         return

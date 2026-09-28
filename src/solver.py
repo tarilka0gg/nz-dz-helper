@@ -589,20 +589,16 @@ class Book4Source(GdzSource):
         
         # Якщо заданий paragraph, спершу перевіряємо його (номер параграфа/теми)
         logger.debug("_text_matches: text=%s, book_page=%s", text, book_page)
-        print(f"_text_matches DEBUG: text={text}, book_page={book_page}")
         if paragraph:
             paragraph_match = self._find_paragraph_match(text, str(paragraph))
             logger.debug("Paragraph match check: %s", paragraph_match)
-            print(f"_text_matches DEBUG: paragraph_match={paragraph_match}")
             if paragraph_match:
                 # Якщо знайдено параграф, це добре, але не обов'язково.
                 # Наприклад, ДЗ може бути "Опрацювати §2, вик. впр.7(ст.13)",
                 # але вправа 7 може бути в іншому параграфі на тій самій сторінці.
                 logger.debug("Paragraph match found, but this is not mandatory")
-                print("_text_matches DEBUG: paragraph matched (optional)")
             # Якщо paragraph не знайдено, не відкидаємо скан — просто продовжуємо перевірку page/exercise
             logger.debug("Paragraph not found, continuing with page/exercise check")
-            print("_text_matches DEBUG: paragraph not found, continuing...")
         
         # СПЕРШУ перевіряємо патерн "стр.X (Y)" який означає "сторінка X, вправа Y"
         logger.debug("Trying PAGE_EXERCISE_RE on: %s", text)
@@ -623,22 +619,18 @@ class Book4Source(GdzSource):
                     # Якщо page збігається, вважати номер в дужках як номер вправи
                     logger.debug("Page match: found_page=%s == page=%s", found_page, page)
                     page_exercise_match = True
-                    print(f"_text_matches DEBUG: found_page={found_page} == page={page}, exercise={exercise}, found_exercise={found_exercise}")
                     if exercise is None:
                         logger.debug("=== _text_matches: MATCH (стр.(N) page only) ===")
                         return True
                     exercise_match = str(found_exercise) == str(exercise).strip()
                     logger.debug("Exercise match (з дужок): %s == %s = %s", found_exercise, exercise, exercise_match)
-                    print(f"_text_matches DEBUG: EXERCISE CHECK: found_exercise={found_exercise} (type={type(found_exercise)}), exercise={exercise} (type={type(exercise)}), match={exercise_match}")
                     if exercise_match:
                         logger.debug("=== _text_matches: MATCH (стр.(N)) ===")
                         return True
-                    print(f"_text_matches DEBUG: EXERCISE MATCH FAILED, continuing...")
                 else:
                     # Page не збігається, це НЕ match для PAGE_EXERCISE_RE
                     logger.debug("Page mismatch: found_page=%s != page=%s", found_page, page)
                     page_exercise_match = False
-                    print(f"_text_matches DEBUG: found_page={found_page} != page={page}, SKIP")
             elif not page:
                 # Якщо page не заданий, вважати номер в дужках як номер вправи
                 logger.debug("Page not specified, using exercise from parens: %s", found_exercise)
@@ -662,10 +654,8 @@ class Book4Source(GdzSource):
             is_page_range_early = page_range_re_early.search(text) is not None
             if not is_page_range_early:
                 logger.debug("PAGE_EXERCISE_RE page mismatch and not page range, skipping")
-                print(f"_text_matches DEBUG: early exit for page mismatch: {found_page} != {page}")
                 return False
 
-        print(f"_text_matches DEBUG: after PAGE_EXERCISE_RE, page_exercise_match={page_exercise_match if 'page_exercise_match' in locals() else 'not set'}")
         
         # DEBUG: логування стану після перевірки PAGE_EXERCISE_RE
         logger.debug(
@@ -2381,7 +2371,11 @@ def _solve_multi_exercise(
         )
 
     with _timed("solve_multi_exercise", subject=task.subject, count=len(numbers)):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(numbers)) as executor:
+        # Реальні ДЗ рідко згадують більш ніж 5-10 номерів — cap тут лише
+        # захист від виродженого вводу (номерів десятки), щоб не плодити
+        # стільки ж ОС-потоків одразу; фактична одночасність мережевих
+        # LLM-викликів все одно обмежена _llm_semaphore окремо.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(numbers), 10)) as executor:
             # executor.map зберігає порядок РЕЗУЛЬТАТІВ = порядку numbers,
             # незалежно від того, який номер порахувався першим.
             results = list(executor.map(_solve_one, numbers))
