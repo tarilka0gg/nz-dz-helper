@@ -274,7 +274,7 @@ def is_review_only(homework_text: str, config: Optional[dict] = None) -> bool:
     йдеться про підготовку до контрольної/самостійної/тесту — це вже не
     "просто повторити", а привід дати чекліст тем (див. solve_task).
     """
-    config = config or _load_config()
+    config = config if config is not None else _load_config()
     review_keywords = config.get("review_keywords") or []
     assessment_keywords = config.get("assessment_keywords") or []
 
@@ -296,7 +296,7 @@ def classify_task(
     None) і предмет не в списку творчих (config.yaml -> creative_subjects).
     Інакше — "creative".
     """
-    config = config or _load_config()
+    config = config if config is not None else _load_config()
 
     write_task_keywords = config.get("write_task_keywords") or []
     if _text_has_keyword(task.homework_text, write_task_keywords):

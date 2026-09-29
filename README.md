@@ -18,7 +18,8 @@ nz-dz-helper/
 │   ├── telegram_bot.py         # Telegram-бот (команди /day /week /task)
 │   └── setup_browser_profile.py  # опційний ручний логін для BrowserChatProvider
 ├── tests/
-│   └── test_text_matches.py    # юніт-тести Book4Source._text_matches (без мережі)
+│   ├── test_parsing_and_classify.py  # regex сторінок/вправ/§, класифікація ДЗ, пошук за предметом
+│   └── test_text_matches.py    # Book4Source._text_matches — точний збіг вправи в ГДЗ-скані
 ├── config.yaml                 # предмети, LLM-провайдери, ключові слова, підручники
 ├── .env.example                 # шаблон змінних середовища (скопіювати в .env)
 ├── requirements.txt
@@ -92,6 +93,17 @@ Studio через Playwright замість офіційного API. **Пору
 сервісів** і на момент написання заблоковане антибот-захистом обох
 сервісів — лишається задокументованим, не рекомендованим шляхом. Перед
 використанням (якщо колись запрацює): `python src/setup_browser_profile.py --service deepseek`.
+
+## Тести
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+Лише stdlib `unittest` (pytest не потрібен), без мережі, і не читають
+реальний `config.yaml`/`.env` — можна запускати з будь-якої теки. Покривають
+чисті функції розбору й класифікації; LLM-провайдери, Telegram-бот і
+скрейпінг ГДЗ/nz.ua тестами поки не покриті.
 
 ## CLI (без Telegram)
 
