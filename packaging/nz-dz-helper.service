@@ -1,0 +1,17 @@
+# systemd user unit. Install:
+#   mkdir -p ~/.config/systemd/user && cp nz-dz-helper.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now nz-dz-helper
+# The data directory (~/.local/share/nz-dz-helper) must hold your .env; the launcher creates the rest.
+[Unit]
+Description=nz-dz-helper Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env nz-dz-helper
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

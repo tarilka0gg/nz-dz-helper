@@ -1,0 +1,6 @@
+# /etc/conf.d/nz-dz-helper
+# The account the bot runs as, and the directory holding its .env, config.yaml, caches and venv.
+nz_dz_user="nzdz"
+nz_dz_home="/var/lib/nz-dz-helper"
+# Where the launcher is installed (PREFIX=/usr/local by default).
+nz_dz_launcher="/usr/local/bin/nz-dz-helper"

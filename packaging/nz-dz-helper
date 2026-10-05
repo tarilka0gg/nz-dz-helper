@@ -1,0 +1,24 @@
+#!/bin/sh
+# Launcher for nz-dz-helper. The program reads config.yaml, .env and its caches from the current directory, so it
+# runs from a data directory of its own (default ~/.local/share/nz-dz-helper, or $NZ_DZ_HOME); the code itself
+# stays in the read-only install. The first run creates a Python venv there and installs requirements.txt.
+set -eu
+APP=$(cd "$(dirname "$(readlink -f "$0")")/../share/nz-dz-helper" && pwd)
+HOME_DIR=${NZ_DZ_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/nz-dz-helper}
+mkdir -p "$HOME_DIR"
+cd "$HOME_DIR"
+
+[ -f config.yaml ] || { cp "$APP/config.yaml" config.yaml; echo "nz-dz-helper: wrote the default config.yaml to $HOME_DIR" >&2; }
+if [ ! -f .env ]; then
+    cp -n "$APP/.env.example" .env.example 2>/dev/null || true
+    echo "nz-dz-helper: no .env in $HOME_DIR. Copy .env.example to .env there and fill it in." >&2
+    exit 1
+fi
+if [ ! -x .venv/bin/python ] || [ "$(cat .venv/.requirements-hash 2>/dev/null || true)" != "$(sha256sum "$APP/requirements.txt" | cut -d' ' -f1)" ]; then
+    echo "nz-dz-helper: preparing the Python environment (first run, or requirements changed)..." >&2
+    python3 -m venv .venv
+    .venv/bin/pip install -q --upgrade pip
+    .venv/bin/pip install -q -r "$APP/requirements.txt"
+    sha256sum "$APP/requirements.txt" | cut -d' ' -f1 > .venv/.requirements-hash
+fi
+exec .venv/bin/python "$APP/src/telegram_bot.py" "$@"

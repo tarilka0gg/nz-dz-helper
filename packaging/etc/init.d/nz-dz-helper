@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# OpenRC service for nz-dz-helper (the Telegram bot). Settings: /etc/conf.d/nz-dz-helper.
+
+description="nz-dz-helper Telegram bot"
+command="/usr/bin/env"
+command_args="NZ_DZ_HOME=${nz_dz_home:-/var/lib/nz-dz-helper} ${nz_dz_launcher:-/usr/local/bin/nz-dz-helper}"
+command_user="${nz_dz_user:-nzdz}"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+directory="${nz_dz_home:-/var/lib/nz-dz-helper}"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+	need net
+}
+
+start_pre() {
+	checkpath -d -m 0750 -o "${command_user}" "${nz_dz_home:-/var/lib/nz-dz-helper}"
+	checkpath -f -m 0640 -o "${command_user}" "${output_log}"
+}
